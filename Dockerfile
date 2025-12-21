@@ -8,6 +8,7 @@ FROM debian:bookworm-slim AS final
 WORKDIR /app
 
 COPY --from=builder /app/main /app/main
+COPY --from=builder /app/drizzle /app/drizzle
 RUN chmod +x /app/main
 
 EXPOSE 8080
