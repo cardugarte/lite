@@ -63,10 +63,10 @@ Required in `.env` (see `.env.example`):
 
 ---
 
-## Fork-Specific: TravelSats Deployment
+## Fork-Specific: Travelsats Deployment
 
 This repository is a fork of [`getAlby/lite`](https://github.com/getAlby/lite)
-maintained for the TravelSats platform deployment.
+maintained for the Travelsats platform deployment.
 
 ### Differences from upstream
 
@@ -77,14 +77,14 @@ following changes:
    — ensures the `drizzle/` directory is present in the runtime image so the
    migrator can find `meta/_journal.json` on startup. Likely candidate for an
    upstream PR.
-2. **`chore(fly): adapt configuration for TravelSats deployment`** (commit
-   `993e393`) and **`chore(fly): switch primary region from gru to iad`**
+2. Commit `993e393` adapts the Fly configuration for the Travelsats deployment,
+   and **`chore(fly): switch primary region from gru to iad`**
    (commit `aa4c556`) — `fly.toml` parameters tuned for the production
-   TravelSats deployment (app name, region, memory, healthcheck grace,
+   Travelsats deployment (app name, region, memory, healthcheck grace,
    `min_machines_running=1` to preserve NWC subscriptions).
 3. **`docs: add CLAUDE.md and deployment guide`** (commit `0392ced`) — this
    file plus initial deployment notes (the original GCP-era guide is
-   superseded by the TravelSats infrastructure doc linked below).
+   superseded by the Travelsats infrastructure doc linked below).
 
 No code changes to `src/`, `db/schema.ts`, or business logic. The upstream
 public API surface is preserved.
@@ -101,7 +101,7 @@ public API surface is preserved.
 
 Detailed operational documentation (architecture diagram, Cloudflare Worker
 code, secret rotation, troubleshooting, costs, migration history) lives in
-the TravelSats main repository:
+the Travelsats main repository:
 [`docs/travelsats-lightning-infrastructure.md`](https://github.com/cardugarte/travelsats.ar/blob/development/docs/travelsats-lightning-infrastructure.md).
 
 ### Deployment workflow
@@ -136,6 +136,6 @@ git push origin master --force-with-lease
 ```
 
 When rebasing, watch for upstream changes to `src/db/schema.ts` — although
-this fork does not modify the schema today, future TravelSats integration may
+this fork does not modify the schema today, future Travelsats integration may
 extend it (e.g., adding columns mirroring the `names` table). If/when that
 happens, document the schema delta in this section.
