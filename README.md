@@ -24,6 +24,19 @@ A minimal Lightning address server powered by [NWC](https://nwc.dev)
 }
 ```
 
+### Verify an invoice (LUD-21)
+
+`GET /lnurlp/:username/verify/:payment_hash`
+
+If the row is already settled, returns the cached preimage. If unpaid, asks the
+wallet with NWC `lookupInvoice` and persists a preimage when Hub has one.
+Lookup failure returns `settled: false` (does not 500). Username must own the
+invoice. This route is public and has no rate limit.
+
+```json
+{ "status": "OK", "settled": true, "preimage": "...", "pr": "lnbc..." }
+```
+
 ## Development
 
 - [Install Deno](https://docs.deno.com/runtime/manual/getting_started/installation/)
