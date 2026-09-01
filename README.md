@@ -29,9 +29,11 @@ A minimal Lightning address server powered by [NWC](https://nwc.dev)
 `GET /lnurlp/:username/verify/:payment_hash`
 
 If the row is already settled, returns the cached preimage. If unpaid, asks the
-wallet with NWC `lookupInvoice` and persists a preimage when Hub has one.
-Lookup failure returns `settled: false` (does not 500). Username must own the
-invoice. This route is public and has no rate limit.
+**owner** wallet with NWC `lookupInvoice` and persists a preimage when Hub has
+one. Lookup failure returns `settled: false` (does not 500). Username must own
+the invoice. This route is public and has no rate limit. TravelSats uses it as
+the QR/external fallback; connected / Hub-isolated pay hashes the WebLN
+preimage first.
 
 ```json
 { "status": "OK", "settled": true, "preimage": "...", "pr": "lnbc..." }

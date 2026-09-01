@@ -53,9 +53,11 @@ Uses Drizzle ORM with PostgreSQL:
 3. LNURL-pay callback creates an invoice via NWC `makeInvoice` and stores the row
 4. `payment_received` marks the row settled (awaited) and may publish a zap
 5. LUD-21 `GET /lnurlp/:user/verify/:payment_hash`: if the row is unpaid, ask
-   the wallet with NWC `lookupInvoice` (Hub). Persist preimage when present.
-   Lookup failure returns `settled: false` (poller-safe). Username must own
-   the invoice. This GET has no rate limit.
+   the **owner** wallet with NWC `lookupInvoice` (Hub). Persist preimage when
+   present. Lookup failure returns `settled: false` (poller-safe). Username
+   must own the invoice. This GET has no rate limit. TravelSats connected /
+   Hub-isolated pay uses BOLT11 preimage first; this verify path is the
+   no-preimage (QR) fallback, not payer-wallet lookup.
 
 ## Environment Variables
 
@@ -92,10 +94,13 @@ This fork is a minimal extension of upstream. Current deltas:
 
 Fork business-logic delta (on top of the deploy/docs commits above):
 
-4. **LUD-21 verify asks the wallet** — if `lite.invoices` is unpaid, GET
-   verify calls NWC `lookupInvoice` against the owner connection secret,
-   persists preimage, returns `{ status: OK, settled, preimage, pr }`.
-   Missed `payment_received` must not keep a paid invoice `settled: false`.
+4. **LUD-21 verify asks the owner wallet** — if `lite.invoices` is unpaid,
+   GET verify calls NWC `lookupInvoice` against the **owner** connection
+   secret (Hub), persists preimage, returns
+   `{ status: OK, settled, preimage, pr }`. This is receiver-side proof for
+   TravelSats QR/external pay. Connected/Hub-isolated pay settles with
+   BOLT11 preimage in Next and does not need this roundtrip. Missed
+   `payment_received` must not keep a paid invoice `settled: false`.
    Tests: `src/lud21-verify.test.ts`. Related: travelsats.ar#1412.
 
 ### Production environment
