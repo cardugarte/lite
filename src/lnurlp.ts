@@ -5,6 +5,7 @@ import { nwc } from "npm:@getalby/sdk";
 import { logger } from "../src/logger.ts";
 import { BASE_URL } from "./constants.ts";
 import { DB } from "./db/db.ts";
+import { verifyInvoiceSettlement } from "./lud21-verify.ts";
 
 export function createLnurlApp(db: DB) {
   const hono = new Hono();
@@ -64,22 +65,46 @@ export function createLnurlApp(db: DB) {
   });
 
   hono.get("/:username/verify/:payment_hash", async (c) => {
+    const username = c.req.param("username");
+    const paymentHash = c.req.param("payment_hash");
+
+    logger.debug("LNURLp verify", { username, payment_hash: paymentHash });
+
+    let invoice = null;
     try {
-      const username = c.req.param("username");
-      const paymentHash = c.req.param("payment_hash");
-
-      logger.debug("LNURLp verify", { username, payment_hash: paymentHash });
-
-      const invoice = await db.findInvoice(paymentHash);
-
-      return c.json({
-        settled: !!invoice.settledAt,
-        preimage: invoice.preimage,
-        pr: invoice.paymentRequest,
-      });
-    } catch (error) {
-      return c.json({ status: "ERROR", reason: "" + error });
+      invoice = await db.findInvoice(paymentHash);
+    } catch {
+      invoice = null;
     }
+
+    let user = null;
+    try {
+      user = await db.findUser(username);
+    } catch {
+      user = null;
+    }
+
+    const body = await verifyInvoiceSettlement({
+      invoice,
+      ownerUserId: user?.id ?? null,
+      lookupInvoice: async () => {
+        if (!user) return null;
+        const nwcClient = new nwc.NWCClient({
+          nostrWalletConnectUrl: user.connectionSecret,
+        });
+        return await nwcClient.lookupInvoice({ payment_hash: paymentHash });
+      },
+      markSettled: async (lookup) => {
+        if (!user || !lookup.preimage) return;
+        await db.markInvoiceSettled(user.id, {
+          payment_hash: paymentHash,
+          preimage: lookup.preimage,
+          settled_at: lookup.settled_at ?? Math.floor(Date.now() / 1000),
+        } as nwc.Nip47Transaction);
+      },
+    });
+
+    return c.json(body);
   });
 
   return hono;

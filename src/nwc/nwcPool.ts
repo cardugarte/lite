@@ -38,7 +38,7 @@ export class NWCPool {
         if (notification.notification_type === "payment_received") {
           const transaction = notification.notification
           try {
-            this._db.markInvoiceSettled(userId, transaction)
+            await this._db.markInvoiceSettled(userId, transaction)
             await this.publishZap(userId, transaction)
           } catch (error) {
             logger.error("error processing payment_received notification", { userId, transaction, error });

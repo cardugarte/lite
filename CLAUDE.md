@@ -34,7 +34,8 @@ deno task cache
 
 - **main.ts**: Entry point - initializes Hono server, runs migrations, sets up NWCPool
 - **users.ts**: User registration endpoint (`POST /users`)
-- **lnurlp.ts**: LNURL-pay callback and verification endpoints
+- **lnurlp.ts**: LNURL-pay callback and LUD-21 verification endpoints
+- **lud21-verify.ts**: GET verify body — cached settle or NWC `lookupInvoice`
 - **nwc/nwcPool.ts**: Manages NWC client subscriptions for all users, handles payment notifications and zap publishing
 - **well-known/**: Serves `.well-known/lnurlp` and `.well-known/nostr.json` endpoints
 
@@ -49,8 +50,14 @@ Uses Drizzle ORM with PostgreSQL:
 
 1. User registers with NWC connection secret and Nostr pubkey via `POST /users`
 2. NWCPool subscribes to payment notifications for the user's wallet
-3. When someone pays to the Lightning address, the callback creates an invoice via NWC
-4. On payment received, NWCPool marks invoice settled and publishes zap receipt to Nostr relays
+3. LNURL-pay callback creates an invoice via NWC `makeInvoice` and stores the row
+4. `payment_received` marks the row settled (awaited) and may publish a zap
+5. LUD-21 `GET /lnurlp/:user/verify/:payment_hash`: if the row is unpaid, ask
+   the **owner** wallet with NWC `lookupInvoice` (Hub). Persist preimage when
+   present. Lookup failure returns `settled: false` (poller-safe). Username
+   must own the invoice. This GET has no rate limit. TravelSats connected /
+   Hub-isolated pay uses BOLT11 preimage first; this verify path is the
+   no-preimage (QR) fallback, not payer-wallet lookup.
 
 ## Environment Variables
 
@@ -70,8 +77,7 @@ maintained for the Travelsats platform deployment.
 
 ### Differences from upstream
 
-This fork is a minimal extension of upstream and currently carries only the
-following changes:
+This fork is a minimal extension of upstream. Current deltas:
 
 1. **`fix: copy drizzle migrations folder in Docker image`** (commit `2adf193`)
    — ensures the `drizzle/` directory is present in the runtime image so the
@@ -86,8 +92,16 @@ following changes:
    file plus initial deployment notes (the original GCP-era guide is
    superseded by the Travelsats infrastructure doc linked below).
 
-No code changes to `src/`, `db/schema.ts`, or business logic. The upstream
-public API surface is preserved.
+Fork business-logic delta (on top of the deploy/docs commits above):
+
+4. **LUD-21 verify asks the owner wallet** — if `lite.invoices` is unpaid,
+   GET verify calls NWC `lookupInvoice` against the **owner** connection
+   secret (Hub), persists preimage, returns
+   `{ status: OK, settled, preimage, pr }`. This is receiver-side proof for
+   TravelSats QR/external pay. Connected/Hub-isolated pay settles with
+   BOLT11 preimage in Next and does not need this roundtrip. Missed
+   `payment_received` must not keep a paid invoice `settled: false`.
+   Tests: `src/lud21-verify.test.ts`. Related: travelsats.ar#1412.
 
 ### Production environment
 
