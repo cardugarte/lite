@@ -5,9 +5,17 @@ import postgres from "npm:postgres@3.4.5";
 
 import { and, eq } from "drizzle-orm";
 import { DATABASE_URL } from "../constants.ts";
+import {
+  assertRebindFresh,
+  assertRebindNostr,
+  hashRebindToken,
+  newRebindToken,
+} from "../spark/rebind.ts";
+import { routeCreateUser } from "../spark/destination.ts";
 import { decrypt, encrypt } from "./aesgcm.ts";
 import * as schema from "./schema.ts";
-import { invoices, users } from "./schema.ts";
+import { invoices, rebindTokens, users } from "./schema.ts";
+import { buildSparkUserValues, parseNwcConnectionSecret } from "./userValues.ts";
 
 export async function runMigration() {
   const migrationClient = postgres(DATABASE_URL, { max: 1 });
@@ -31,10 +39,7 @@ export class DB {
     username?: string,
     nostrPubkey?: string
   ) {
-    const parsed = nwc.NWCClient.parseWalletConnectUrl(connectionSecret);
-    if (!parsed.secret) {
-      throw new Error("no secret found in connection secret");
-    }
+    parseNwcConnectionSecret(connectionSecret);
     // TODO: use haikunator    
     username = username || Math.floor(Math.random() * 100000000000).toString();
     
@@ -51,6 +56,24 @@ export class DB {
     return newUser;
   }
 
+  async createSparkUser(
+    sparkIdentityPubkey: string,
+    username?: string,
+    nostrPubkey?: string
+  ) {
+    const values = buildSparkUserValues({
+      sparkIdentityPubkey,
+      username,
+      nostrPubkey,
+    });
+    const [newUser] = await this._db.insert(users).values(values).returning({
+      id: users.id,
+      username: users.username,
+      nostrPubkey: users.nostrPubkey,
+    });
+    return newUser;
+  }
+
   getAllUsers() {
     return this._db.query.users.findMany();
   }
@@ -62,11 +85,16 @@ export class DB {
     if (!result) {
       throw new Error("user not found");
     }
-    const connectionSecret = await decrypt(result.encryptedConnectionSecret);
+    const connectionSecret = result.encryptedConnectionSecret
+      ? await decrypt(result.encryptedConnectionSecret)
+      : null;
     return {
       id: result.id,
+      username: result.username,
       nostrPubkey: result.nostrPubkey,
-      connectionSecret
+      connectionSecret,
+      destination: result.destination,
+      sparkIdentityPubkey: result.sparkIdentityPubkey,
     };
   }
 
@@ -114,5 +142,84 @@ export class DB {
       )
 
     return;
+  }
+
+  async markInvoiceSettledByPaymentHash(
+    paymentHash: string,
+    preimage: string,
+    settledAt: Date = new Date(),
+  ): Promise<void> {
+    await this._db
+      .update(invoices)
+      .set({
+        preimage,
+        settledAt,
+      })
+      .where(eq(invoices.paymentHash, paymentHash));
+  }
+
+  async issueRebindToken(username: string): Promise<string> {
+    await this.findUser(username);
+    const token = newRebindToken();
+    await this._db.insert(rebindTokens).values({
+      username,
+      tokenHash: hashRebindToken(token),
+    });
+    return token;
+  }
+
+  async rebindUser(input: {
+    username: string;
+    nostrPubkey: string;
+    rebindToken: string;
+    sparkIdentityPubkey?: string;
+    connectionSecret?: string;
+  }): Promise<void> {
+    const route = routeCreateUser(input);
+    if (route.kind === "error") {
+      throw new Error(route.reason);
+    }
+
+    const tokenHash = hashRebindToken(input.rebindToken);
+
+    await this._db.transaction(async (tx) => {
+      const tokenRow = assertRebindFresh(
+        await tx.query.rebindTokens.findFirst({
+          where: eq(rebindTokens.tokenHash, tokenHash),
+        }),
+        input.username,
+      );
+
+      const user = await tx.query.users.findFirst({
+        where: eq(users.username, input.username),
+      });
+      if (!user) {
+        throw new Error("user not found");
+      }
+      assertRebindNostr(user.nostrPubkey, input.nostrPubkey);
+
+      if (route.kind === "spark") {
+        await tx.update(users).set({
+          destination: "spark",
+          sparkIdentityPubkey: route.sparkIdentityPubkey,
+          encryptedConnectionSecret: null,
+        }).where(eq(users.id, user.id));
+      } else {
+        parseNwcConnectionSecret(route.connectionSecret);
+        const encryptedConnectionSecret = await encrypt(route.connectionSecret);
+        await tx.update(users).set({
+          destination: null,
+          sparkIdentityPubkey: null,
+          encryptedConnectionSecret,
+        }).where(eq(users.id, user.id));
+      }
+
+      if (tokenRow.id == null) {
+        throw new Error("invalid rebind token");
+      }
+      await tx.update(rebindTokens).set({ usedAt: new Date() }).where(
+        eq(rebindTokens.id, tokenRow.id),
+      );
+    });
   }
 }

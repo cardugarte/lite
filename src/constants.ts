@@ -17,3 +17,8 @@ export const DATABASE_URL = databaseUrl;
 
 export const NOSTR_NIP57_PRIVATE_KEY = Deno.env.get("NOSTR_NIP57_PRIVATE_KEY") || "";
 export const NOSTR_NIP57_PUBLIC_KEY = NOSTR_NIP57_PRIVATE_KEY ? getPublicKey(hexToBytes(NOSTR_NIP57_PRIVATE_KEY)) : "";
+
+export const BREEZ_API_KEY = Deno.env.get("BREEZ_API_KEY") || "";
+export const SPARK_MINTER_MNEMONIC = Deno.env.get("SPARK_MINTER_MNEMONIC") || "";
+export const SPARK_WEBHOOK_SECRET = Deno.env.get("SPARK_WEBHOOK_SECRET") || "";
+export const SPARK_MINTER_STORAGE_DIR = Deno.env.get("SPARK_MINTER_STORAGE_DIR") || "./.spark-minter";

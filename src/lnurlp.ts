@@ -2,12 +2,14 @@ import { Event } from "@nostr/tools";
 import { validateZapRequest } from "@nostr/tools/nip57";
 import { Hono } from "hono";
 import { nwc } from "npm:@getalby/sdk";
-import { logger } from "../src/logger.ts";
+import { logger } from "./logger.ts";
 import { BASE_URL } from "./constants.ts";
 import { DB } from "./db/db.ts";
 import { verifyInvoiceSettlement } from "./lud21-verify.ts";
+import { isSparkUser } from "./spark/destination.ts";
+import type { SparkMinter } from "./spark/minter.ts";
 
-export function createLnurlApp(db: DB) {
+export function createLnurlApp(db: DB, sparkMinter?: SparkMinter) {
   const hono = new Hono();
 
   hono.get("/:username/callback", async (c) => {
@@ -36,20 +38,51 @@ export function createLnurlApp(db: DB) {
       const description = zapRequest ? zapRequest.content : comment;
 
       const user = await db.findUser(username);
+      const amountMsats = Math.floor(+amount / 1000) * 1000;
+      const metadata = {
+        comment: comment || undefined,
+        payer_data: payerData || undefined,
+        nostr: zapRequest || undefined,
+      };
+
+      if (isSparkUser(user)) {
+        if (!user.sparkIdentityPubkey) {
+          throw new Error("spark user missing identity pubkey");
+        }
+        if (!sparkMinter) {
+          throw new Error("spark minter is not configured");
+        }
+        const minted = await sparkMinter.createInvoice({
+          receiverIdentityPubkey: user.sparkIdentityPubkey,
+          amountSats: Math.floor(+amount / 1000),
+          memo: description,
+        });
+        await db.createInvoice(user.id, {
+          amount: amountMsats,
+          description,
+          invoice: minted.invoice,
+          payment_hash: minted.paymentHash,
+          metadata,
+        } as unknown as nwc.Nip47Transaction);
+        return c.json({
+          verify: `${BASE_URL}/lnurlp/${username}/verify/${minted.paymentHash}`,
+          routes: [],
+          pr: minted.invoice,
+        });
+      }
+
+      if (!user.connectionSecret) {
+        throw new Error("user missing connection secret");
+      }
 
       const nwcClient = new nwc.NWCClient({
         nostrWalletConnectUrl: user.connectionSecret,
       });
 
       const transaction = await nwcClient.makeInvoice({
-        amount: Math.floor(+amount / 1000) * 1000,
+        amount: amountMsats,
         description,
-        metadata: {
-          comment: comment || undefined,
-          // TODO: payer_data can be improved using nostr worker
-          payer_data: payerData || undefined,
-          nostr: zapRequest || undefined,
-        }
+        metadata,
       });
 
       await db.createInvoice(user.id, transaction);
@@ -84,18 +117,21 @@ export function createLnurlApp(db: DB) {
       user = null;
     }
 
+    const spark = user ? isSparkUser(user) : false;
+
     const body = await verifyInvoiceSettlement({
       invoice,
       ownerUserId: user?.id ?? null,
       lookupInvoice: async () => {
-        if (!user) return null;
+        if (!user || spark) return null;
+        if (!user.connectionSecret) return null;
         const nwcClient = new nwc.NWCClient({
           nostrWalletConnectUrl: user.connectionSecret,
         });
         return await nwcClient.lookupInvoice({ payment_hash: paymentHash });
       },
       markSettled: async (lookup) => {
-        if (!user || !lookup.preimage) return;
+        if (!user || spark || !lookup.preimage) return;
         await db.markInvoiceSettled(user.id, {
           payment_hash: paymentHash,
           preimage: lookup.preimage,

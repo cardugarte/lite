@@ -6,22 +6,26 @@ import { NOSTR_NIP57_PRIVATE_KEY } from "../constants.ts";
 import { decrypt } from "../db/aesgcm.ts";
 import { DB } from "../db/db.ts";
 import { logger } from "../logger.ts";
+import { shouldSubscribeNwc } from "../spark/destination.ts";
 
 export class NWCPool {
   private readonly _db: DB;
   private readonly pool: SimplePool;
   private readonly zapperPrivateKey: string;
+  private readonly decryptFn: (secret: string) => Promise<string>;
 
-  constructor(db: DB) {
+  constructor(db: DB, decryptFn: (secret: string) => Promise<string> = decrypt) {
     this._db = db;
     this.pool = new SimplePool()
     this.zapperPrivateKey = NOSTR_NIP57_PRIVATE_KEY;
+    this.decryptFn = decryptFn;
   }
 
   async init() {
     const users = await this._db.getAllUsers();
     for (const user of users) {
-      const connectionSecret = await decrypt(user.encryptedConnectionSecret);
+      if (!shouldSubscribeNwc(user)) continue;
+      const connectionSecret = await this.decryptFn(user.encryptedConnectionSecret as string);
       this.subscribeUser(connectionSecret, user.id);
     }
   }
