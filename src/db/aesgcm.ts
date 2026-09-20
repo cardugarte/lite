@@ -8,7 +8,7 @@ if (!encryptionKeyBase64) {
 
 const encryptionKey = await crypto.subtle.importKey(
   "raw",
-  Buffer.from(encryptionKeyBase64, "base64"),
+  Uint8Array.from(Buffer.from(encryptionKeyBase64, "base64")),
   {
     name: "AES-GCM",
     length: 256, // Can be  128, 192, or 256
@@ -52,8 +52,8 @@ export async function decrypt(
 ): Promise<string> {
   const combined = Buffer.from(combinedBase64, "base64");
 
-  const iv = combined.subarray(0, IV_LENGTH); // Extract first IV_LENGTH bytes as IV
-  const ciphertext = combined.subarray(IV_LENGTH);
+  const iv = new Uint8Array(combined.subarray(0, IV_LENGTH));
+  const ciphertext = new Uint8Array(combined.subarray(IV_LENGTH));
 
   const decrypted = await crypto.subtle.decrypt(
     {
