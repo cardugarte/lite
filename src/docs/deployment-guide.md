@@ -24,8 +24,15 @@ This guide covers deploying Alby Lite (Lightning address server powered by NWC) 
 | `BASE_URL` | Yes | Public URL of the server |
 | `ENCRYPTION_KEY` | Yes | AES-GCM key for encrypting NWC secrets |
 | `NOSTR_NIP57_PRIVATE_KEY` | Yes | Private key for signing zap receipts |
+| `BREEZ_API_KEY` | Spark | Server-side Breez API key for the minter. Never put this in a client bundle. |
+| `SPARK_MINTER_MNEMONIC` | Spark | Minter wallet seed only (invoices + creator webhook). Never a user seed. |
+| `SPARK_WEBHOOK_SECRET` | Spark | HMAC secret for `POST /spark/webhook` (`X-Spark-Signature`) |
+| `SPARK_MINTER_STORAGE_DIR` | No | SDK storage directory (default `./.spark-minter`) |
 | `LOG_LEVEL` | No | Logging verbosity (DEBUG, INFO, WARN, ERROR) |
 | `PORT` | No | Server port (default: 8080) |
+
+Spark and NWC users share the existing Postgres. Do not add a second database.
+Do not run Breez's LNURL server alongside this app.
 
 ## Local Development
 
@@ -214,11 +221,21 @@ gcloud run deploy alby-lite-prod \
 
 **Endpoint:** `POST /users`
 
-**Request:**
+**Request (NWC):**
 
 ```json
 {
   "connectionSecret": "nostr+walletconnect://...",
+  "nostrPubkey": "npub... or hex pubkey",
+  "username": "optional-username"
+}
+```
+
+**Request (Spark):**
+
+```json
+{
+  "sparkIdentityPubkey": "02…",
   "nostrPubkey": "npub... or hex pubkey",
   "username": "optional-username"
 }

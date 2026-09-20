@@ -33,10 +33,11 @@ deno task cache
 ### Core Components
 
 - **main.ts**: Entry point - initializes Hono server, runs migrations, sets up NWCPool
-- **users.ts**: User registration endpoint (`POST /users`)
+- **users.ts**: User registration (`POST /users`) and single-use rebind (`POST /users/rebind`)
 - **lnurlp.ts**: LNURL-pay callback and LUD-21 verification endpoints
 - **lud21-verify.ts**: GET verify body — cached settle or NWC `lookupInvoice`
-- **nwc/nwcPool.ts**: Manages NWC client subscriptions for all users, handles payment notifications and zap publishing
+- **spark/**: SparkMinter port, Breez WASM adapter, webhook HMAC, destination routing
+- **nwc/nwcPool.ts**: Manages NWC client subscriptions for all users, handles payment notifications and zap publishing. Skips spark rows.
 - **well-known/**: Serves `.well-known/lnurlp` and `.well-known/nostr.json` endpoints
 
 ### Database
@@ -102,6 +103,15 @@ Fork business-logic delta (on top of the deploy/docs commits above):
    BOLT11 preimage in Next and does not need this roundtrip. Missed
    `payment_received` must not keep a paid invoice `settled: false`.
    Tests: `src/lud21-verify.test.ts`. Related: travelsats.ar#1412.
+5. **Spark minter (issue #1556 / epic #1550)** — additive `users.destination`
+   (NULL = nwc), `users.spark_identity_pubkey`, nullable `connection_secret`.
+   `POST /users` with `sparkIdentityPubkey` (xor NWC secret) stores no spendable
+   secret. LNURL callback mints via `@breeztech/breez-sdk-spark@0.25.0` Deno
+   WASM for the **row** identity pubkey (request destination ignored). Creator
+   webhook `POST /spark/webhook` HMAC-verifies `X-Spark-Signature` and persists
+   preimage; spark LUD-21 never calls NWC. `nwcPool.init` skips spark rows.
+   Rebind is `POST /users/rebind` with nostr pubkey + single-use token. Minter
+   seed is not a user seed; no Breez LNURL server; no second Postgres.
 
 ### Production environment
 
