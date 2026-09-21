@@ -100,13 +100,19 @@ export function createUsersApp(db: DB, nwcPool: NWCPool) {
         return c.text("invalid nostr pubkey provided", 400);
       }
 
-      await db.rebindUser({
+      const rebound = await db.rebindUser({
         username: body.username,
         nostrPubkey,
         rebindToken: body.rebindToken,
         sparkIdentityPubkey: body.sparkIdentityPubkey,
         connectionSecret: body.connectionSecret,
       });
+
+      if (rebound.kind === "nwc") {
+        nwcPool.subscribeUser(rebound.connectionSecret, rebound.userId);
+      } else {
+        nwcPool.unsubscribeUser(rebound.userId);
+      }
 
       return c.json({ status: "OK" });
     } catch (error) {

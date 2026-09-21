@@ -40,3 +40,26 @@ Deno.test("nwcPool.init skips spark rows and never decrypts them", async () => {
   expect(decryptCalls).toEqual(["enc-nwc"]);
   expect(subscribed).toEqual([2]);
 });
+
+Deno.test("subscribeUser replaces an existing subscription for the same userId", () => {
+  const closed: string[] = [];
+  let created = 0;
+  const pool = new NWCPool(
+    { getAllUsers: async () => [] } as unknown as DB,
+    async (secret) => secret,
+    (url: string) => {
+      created += 1;
+      const label = url;
+      return {
+        subscribeNotifications: () => undefined,
+        close: () => closed.push(label),
+      };
+    },
+  );
+  pool.subscribeUser("first", 1);
+  pool.subscribeUser("second", 1);
+  expect(created).toEqual(2);
+  expect(closed).toEqual(["first"]);
+  pool.unsubscribeUser(1);
+  expect(closed).toEqual(["first", "second"]);
+});

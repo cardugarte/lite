@@ -2,7 +2,7 @@ import "../test_setup.ts";
 import { expect } from "jsr:@std/expect";
 import type { SparkMinter } from "./minter.ts";
 
-type SparkMinterIsInvoiceOnly = keyof SparkMinter extends "createInvoice" ? true
+type SparkMinterIsInvoiceOnly = Exclude<keyof SparkMinter, "connect"> extends "createInvoice" ? true
   : false;
 const sparkMinterIsInvoiceOnly: SparkMinterIsInvoiceOnly = true;
 
@@ -21,7 +21,7 @@ Deno.test("SparkMinter only exposes createInvoice", () => {
   const match = src.match(/export type SparkMinter = \{([\s\S]*?)\n\};/);
   expect(match === null).toEqual(false);
   const methods = [...match![1].matchAll(/(\w+)\s*\(/g)].map((m) => m[1]);
-  expect(methods).toEqual(["createInvoice"]);
+  expect(methods.filter((name) => name !== "connect")).toEqual(["createInvoice"]);
   assertNoSendApi(src);
   expect(sparkMinterIsInvoiceOnly).toEqual(true);
 });

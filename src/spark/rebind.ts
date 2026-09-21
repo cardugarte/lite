@@ -35,3 +35,9 @@ export function assertRebindNostr(stored: string, presented: string): void {
     throw new Error("unauthorized");
   }
 }
+
+export function consumeRebindTokenCount(count: number): void {
+  if (count !== 1) {
+    throw new Error("invalid rebind token");
+  }
+}

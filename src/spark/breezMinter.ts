@@ -1,5 +1,5 @@
 import { paymentHashFromBolt11 } from "./bolt11.ts";
-import { BREEZ_SDK_SPARK_DENO_SPECIFIER, type SparkMinter } from "./minter.ts";
+import { type SparkMinter } from "./minter.ts";
 
 type BreezSdk = {
   registerWebhook(request: {
@@ -32,6 +32,13 @@ export function sparkReceiveWebhookUrl(baseUrl: string): string {
   return `${baseUrl.replace(/\/$/, "")}/spark/webhook`;
 }
 
+export function resolveSparkWebhookUrl(baseUrl: string, override?: string): string {
+  if (override && override.trim()) {
+    return override.replace(/\/$/, "");
+  }
+  return sparkReceiveWebhookUrl(baseUrl);
+}
+
 export function createBreezSparkMinter(opts: {
   apiKey: string;
   mnemonic: string;
@@ -47,7 +54,7 @@ export function createBreezSparkMinter(opts: {
       sdkPromise = (async () => {
         const breez = opts.loadBreez
           ? await opts.loadBreez()
-          : await import(BREEZ_SDK_SPARK_DENO_SPECIFIER) as BreezModule;
+          : await import("npm:@breeztech/breez-sdk-spark@0.25.0/deno/breez_sdk_spark_wasm.js") as BreezModule;
         const config = breez.defaultConfig("mainnet");
         config.apiKey = opts.apiKey;
         const client = await breez.connect({
@@ -63,10 +70,18 @@ export function createBreezSparkMinter(opts: {
         return client;
       })();
     }
-    return sdkPromise;
+    try {
+      return await sdkPromise;
+    } catch (error) {
+      sdkPromise = null;
+      throw error;
+    }
   }
 
   return {
+    async connect() {
+      await sdk();
+    },
     async createInvoice({ receiverIdentityPubkey, amountSats, memo }) {
       const client = await sdk();
       const response = await client.receivePayment({

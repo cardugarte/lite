@@ -121,6 +121,10 @@ Fork business-logic delta (on top of the deploy/docs commits above):
 - **Public URL via Cloudflare Worker:** `https://travelsats.ar/.well-known/lnurlp/*`,
   `https://travelsats.ar/.well-known/nostr.json`, and
   `https://travelsats.ar/lnurlp/*` are routed to this app.
+- **Spark webhook:** Breez POSTs `SPARK_WEBHOOK_URL` (default
+  `${BASE_URL}/spark/webhook`). Until `/spark/webhook` is proxied on
+  `travelsats.ar`, set `SPARK_WEBHOOK_URL` to the Fly origin
+  (`https://travelsats-alby-lite.fly.dev/spark/webhook`).
 - **Direct app URL:** `https://travelsats-alby-lite.fly.dev`
 
 Detailed operational documentation (architecture diagram, Cloudflare Worker

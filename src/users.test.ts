@@ -20,10 +20,15 @@ function postgresUniqueError() {
 
 function mockPool() {
   const subscribed: Array<{ secret: string; userId: number }> = [];
+  const unsubscribed: number[] = [];
   return {
     subscribed,
+    unsubscribed,
     subscribeUser(secret: string, userId: number) {
       subscribed.push({ secret, userId });
+    },
+    unsubscribeUser(userId: number) {
+      unsubscribed.push(userId);
     },
   };
 }
@@ -172,4 +177,49 @@ Deno.test("POST /users/rebind rejects replay of a used token", async () => {
   const json = await second.json();
   expect(json.status).toEqual("ERROR");
   expect(json.reason).toMatch(/already used/);
+});
+
+Deno.test("POST /users/rebind to Spark unsubscribes the leftover NWC client", async () => {
+  const pool = mockPool();
+  const db = {
+    rebindUser: async () => ({ userId: 7, kind: "spark" as const }),
+  } as unknown as DB;
+  const app = createUsersApp(db, pool as unknown as NWCPool);
+  const res = await app.request("/rebind", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "alice",
+      nostrPubkey: NOSTR,
+      rebindToken: "tok",
+      sparkIdentityPubkey: SPARK_PUBKEY,
+    }),
+  });
+  expect(res.status).toEqual(200);
+  expect(pool.unsubscribed).toEqual([7]);
+  expect(pool.subscribed).toHaveLength(0);
+});
+
+Deno.test("POST /users/rebind to NWC subscribes the new secret", async () => {
+  const pool = mockPool();
+  const db = {
+    rebindUser: async () => ({
+      userId: 8,
+      kind: "nwc" as const,
+      connectionSecret: NWC_URL,
+    }),
+  } as unknown as DB;
+  const app = createUsersApp(db, pool as unknown as NWCPool);
+  const res = await app.request("/rebind", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "alice",
+      nostrPubkey: NOSTR,
+      rebindToken: "tok",
+      connectionSecret: NWC_URL,
+    }),
+  });
+  expect(res.status).toEqual(200);
+  expect(pool.subscribed).toEqual([{ secret: NWC_URL, userId: 8 }]);
 });

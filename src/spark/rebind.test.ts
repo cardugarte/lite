@@ -2,6 +2,7 @@ import { expect } from "jsr:@std/expect";
 import {
   assertRebindFresh,
   assertRebindNostr,
+  consumeRebindTokenCount,
   hashRebindToken,
 } from "./rebind.ts";
 
@@ -26,6 +27,11 @@ Deno.test("rebind requires the existing nostr pubkey", () => {
     "unauthorized",
   );
   expect(() => assertRebindNostr("aa".repeat(32), "aa".repeat(32))).not.toThrow();
+});
+
+Deno.test("consumeRebindTokenCount rejects a miss so a replay cannot rewrite the user", () => {
+  expect(() => consumeRebindTokenCount(0)).toThrow("invalid rebind token");
+  expect(() => consumeRebindTokenCount(1)).not.toThrow();
 });
 
 Deno.test("rebind token hash is sha256 of the presented token", () => {

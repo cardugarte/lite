@@ -3,11 +3,11 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { nwc } from "npm:@getalby/sdk";
 import postgres from "npm:postgres@3.4.5";
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { DATABASE_URL } from "../constants.ts";
 import {
-  assertRebindFresh,
   assertRebindNostr,
+  consumeRebindTokenCount,
   hashRebindToken,
   newRebindToken,
 } from "../spark/rebind.ts";
@@ -174,7 +174,10 @@ export class DB {
     rebindToken: string;
     sparkIdentityPubkey?: string;
     connectionSecret?: string;
-  }): Promise<void> {
+  }): Promise<
+    | { userId: number; kind: "spark" }
+    | { userId: number; kind: "nwc"; connectionSecret: string }
+  > {
     const route = routeCreateUser(input);
     if (route.kind === "error") {
       throw new Error(route.reason);
@@ -182,13 +185,15 @@ export class DB {
 
     const tokenHash = hashRebindToken(input.rebindToken);
 
-    await this._db.transaction(async (tx) => {
-      const tokenRow = assertRebindFresh(
-        await tx.query.rebindTokens.findFirst({
-          where: eq(rebindTokens.tokenHash, tokenHash),
-        }),
-        input.username,
-      );
+    return await this._db.transaction(async (tx) => {
+      const consumed = await tx.update(rebindTokens).set({ usedAt: new Date() }).where(
+        and(
+          eq(rebindTokens.tokenHash, tokenHash),
+          eq(rebindTokens.username, input.username),
+          isNull(rebindTokens.usedAt),
+        ),
+      ).returning();
+      consumeRebindTokenCount(consumed.length);
 
       const user = await tx.query.users.findFirst({
         where: eq(users.username, input.username),
@@ -204,22 +209,21 @@ export class DB {
           sparkIdentityPubkey: route.sparkIdentityPubkey,
           encryptedConnectionSecret: null,
         }).where(eq(users.id, user.id));
-      } else {
-        parseNwcConnectionSecret(route.connectionSecret);
-        const encryptedConnectionSecret = await encrypt(route.connectionSecret);
-        await tx.update(users).set({
-          destination: null,
-          sparkIdentityPubkey: null,
-          encryptedConnectionSecret,
-        }).where(eq(users.id, user.id));
+        return { userId: user.id, kind: "spark" as const };
       }
 
-      if (tokenRow.id == null) {
-        throw new Error("invalid rebind token");
-      }
-      await tx.update(rebindTokens).set({ usedAt: new Date() }).where(
-        eq(rebindTokens.id, tokenRow.id),
-      );
+      parseNwcConnectionSecret(route.connectionSecret);
+      const encryptedConnectionSecret = await encrypt(route.connectionSecret);
+      await tx.update(users).set({
+        destination: null,
+        sparkIdentityPubkey: null,
+        encryptedConnectionSecret,
+      }).where(eq(users.id, user.id));
+      return {
+        userId: user.id,
+        kind: "nwc" as const,
+        connectionSecret: route.connectionSecret,
+      };
     });
   }
 }

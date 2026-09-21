@@ -118,6 +118,7 @@ Hub-isolated pay hashes the WebLN preimage first.
 - BREEZ_API_KEY: server-side Breez API key for the Spark minter (never ship in a client bundle)
 - SPARK_MINTER_MNEMONIC: seed of the **minter** wallet only (create invoices + creator webhook). Not a user seed. Do not enable SDK multi-user server mode.
 - SPARK_WEBHOOK_SECRET: HMAC secret registered with the minter webhook
+- SPARK_WEBHOOK_URL: optional absolute URL Breez POSTs (default `${BASE_URL}/spark/webhook`). Until `travelsats.ar` proxies `/spark/webhook`, set this to the Fly origin.
 - SPARK_MINTER_STORAGE_DIR: optional SDK storage dir (default `./.spark-minter`)
 
 Spark minting uses the same Postgres as NWC users. There is no second database

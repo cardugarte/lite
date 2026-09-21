@@ -34,6 +34,15 @@ Deno.test("createSparkUser rejects a missing spark identity pubkey", () => {
   ).toThrow("no spark identity pubkey provided");
 });
 
+Deno.test("createSparkUser rejects a non-compressed spark identity pubkey", () => {
+  expect(() =>
+    buildSparkUserValues({
+      sparkIdentityPubkey: "not-a-key",
+      username: "alice",
+    })
+  ).toThrow(/compressed secp256k1/i);
+});
+
 Deno.test("NWC createUser still parses a wallet connect URI with a secret", () => {
   const parsed = parseNwcConnectionSecret(NWC_URL);
   expect(parsed.secret).toEqual(

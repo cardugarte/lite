@@ -8,7 +8,7 @@ import { DB, runMigration } from "./db/db.ts";
 import { createLnurlApp } from "./lnurlp.ts";
 import { LOG_LEVEL, logger, loggerMiddleware } from "./logger.ts";
 import { NWCPool } from "./nwc/nwcPool.ts";
-import { createBreezSparkMinter, sparkReceiveWebhookUrl } from "./spark/breezMinter.ts";
+import { createBreezSparkMinter, resolveSparkWebhookUrl } from "./spark/breezMinter.ts";
 import { createSparkWebhookApp } from "./spark/webhook.ts";
 import { createUsersApp } from "./users.ts";
 import { createLnurlWellKnownApp, createNostrWellKnownApp } from "./well-known/index.ts";
@@ -22,11 +22,16 @@ const sparkMinter = BREEZ_API_KEY && SPARK_MINTER_MNEMONIC && SPARK_WEBHOOK_SECR
   ? createBreezSparkMinter({
     apiKey: BREEZ_API_KEY,
     mnemonic: SPARK_MINTER_MNEMONIC,
-    webhookUrl: sparkReceiveWebhookUrl(BASE_URL),
+    webhookUrl: resolveSparkWebhookUrl(BASE_URL, Deno.env.get("SPARK_WEBHOOK_URL") ?? undefined),
     webhookSecret: SPARK_WEBHOOK_SECRET,
     storageDir: SPARK_MINTER_STORAGE_DIR,
   })
   : undefined;
+if (sparkMinter?.connect) {
+  void sparkMinter.connect().catch((error) => {
+    logger.error("spark minter warmup failed", { error });
+  });
+}
 
 // TODO: re-enable sentry
 //const SENTRY_DSN = Deno.env.get("SENTRY_DSN");

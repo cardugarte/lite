@@ -2,7 +2,6 @@ import { bigint, index, integer, jsonb, pgTable, serial, text, timestamp } from 
 
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
-  // NULL for spark users. NULL destination also means nwc.
   encryptedConnectionSecret: text("connection_secret"),
   username: text("username").unique().notNull(),
   nostrPubkey: text("nostr_pubkey").notNull(),
