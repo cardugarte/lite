@@ -3,12 +3,12 @@ import { cors } from "hono/cors";
 import { serveStatic } from "hono/deno";
 import { secureHeaders } from "hono/secure-headers";
 //import { sentry } from "npm:@hono/sentry";
-import { BREEZ_API_KEY, PORT, SPARK_MINTER_MNEMONIC, SPARK_MINTER_STORAGE_DIR, SPARK_WEBHOOK_SECRET } from "./constants.ts";
+import { BASE_URL, BREEZ_API_KEY, PORT, SPARK_MINTER_MNEMONIC, SPARK_MINTER_STORAGE_DIR, SPARK_WEBHOOK_SECRET } from "./constants.ts";
 import { DB, runMigration } from "./db/db.ts";
 import { createLnurlApp } from "./lnurlp.ts";
 import { LOG_LEVEL, logger, loggerMiddleware } from "./logger.ts";
 import { NWCPool } from "./nwc/nwcPool.ts";
-import { createBreezSparkMinter } from "./spark/breezMinter.ts";
+import { createBreezSparkMinter, sparkReceiveWebhookUrl } from "./spark/breezMinter.ts";
 import { createSparkWebhookApp } from "./spark/webhook.ts";
 import { createUsersApp } from "./users.ts";
 import { createLnurlWellKnownApp, createNostrWellKnownApp } from "./well-known/index.ts";
@@ -18,10 +18,12 @@ await runMigration();
 const db = new DB();
 const nwcPool = new NWCPool(db);
 await nwcPool.init();
-const sparkMinter = BREEZ_API_KEY && SPARK_MINTER_MNEMONIC
+const sparkMinter = BREEZ_API_KEY && SPARK_MINTER_MNEMONIC && SPARK_WEBHOOK_SECRET
   ? createBreezSparkMinter({
     apiKey: BREEZ_API_KEY,
     mnemonic: SPARK_MINTER_MNEMONIC,
+    webhookUrl: sparkReceiveWebhookUrl(BASE_URL),
+    webhookSecret: SPARK_WEBHOOK_SECRET,
     storageDir: SPARK_MINTER_STORAGE_DIR,
   })
   : undefined;

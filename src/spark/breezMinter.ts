@@ -1,7 +1,12 @@
 import { paymentHashFromBolt11 } from "./bolt11.ts";
-import type { SparkMinter } from "./minter.ts";
+import { BREEZ_SDK_SPARK_DENO_SPECIFIER, type SparkMinter } from "./minter.ts";
 
 type BreezSdk = {
+  registerWebhook(request: {
+    url: string;
+    secret: string;
+    eventTypes: Array<{ type: "lightningReceiveFinished" }>;
+  }): Promise<{ webhookId: string }>;
   receivePayment(request: {
     paymentMethod: {
       type: "bolt11Invoice";
@@ -23,26 +28,39 @@ type BreezModule = {
   }) => Promise<BreezSdk>;
 };
 
+export function sparkReceiveWebhookUrl(baseUrl: string): string {
+  return `${baseUrl.replace(/\/$/, "")}/spark/webhook`;
+}
+
 export function createBreezSparkMinter(opts: {
   apiKey: string;
   mnemonic: string;
+  webhookUrl: string;
+  webhookSecret: string;
   storageDir?: string;
+  loadBreez?: () => Promise<BreezModule>;
 }): SparkMinter {
   let sdkPromise: Promise<BreezSdk> | null = null;
 
   async function sdk(): Promise<BreezSdk> {
     if (!sdkPromise) {
       sdkPromise = (async () => {
-        const breez = await import(
-          "npm:@breeztech/breez-sdk-spark@0.25.0/deno/breez_sdk_spark_wasm.js"
-        ) as BreezModule;
+        const breez = opts.loadBreez
+          ? await opts.loadBreez()
+          : await import(BREEZ_SDK_SPARK_DENO_SPECIFIER) as BreezModule;
         const config = breez.defaultConfig("mainnet");
         config.apiKey = opts.apiKey;
-        return await breez.connect({
+        const client = await breez.connect({
           config,
           seed: { type: "mnemonic", mnemonic: opts.mnemonic, passphrase: undefined },
           storageDir: opts.storageDir ?? "./.spark-minter",
         });
+        await client.registerWebhook({
+          url: opts.webhookUrl,
+          secret: opts.webhookSecret,
+          eventTypes: [{ type: "lightningReceiveFinished" }],
+        });
+        return client;
       })();
     }
     return sdkPromise;

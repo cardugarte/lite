@@ -26,7 +26,7 @@ This guide covers deploying Alby Lite (Lightning address server powered by NWC) 
 | `NOSTR_NIP57_PRIVATE_KEY` | Yes | Private key for signing zap receipts |
 | `BREEZ_API_KEY` | Spark | Server-side Breez API key for the minter. Never put this in a client bundle. |
 | `SPARK_MINTER_MNEMONIC` | Spark | Minter wallet seed only (invoices + creator webhook). Never a user seed. |
-| `SPARK_WEBHOOK_SECRET` | Spark | HMAC secret for `POST /spark/webhook` (`X-Spark-Signature`) |
+| `SPARK_WEBHOOK_SECRET` | Spark | HMAC secret for `POST /spark/webhook` (`X-Spark-Signature`). After `connect` the minter registers this URL with Breez (`lightningReceiveFinished`) so LUD-21 can persist the preimage. |
 | `SPARK_MINTER_STORAGE_DIR` | No | SDK storage directory (default `./.spark-minter`) |
 | `LOG_LEVEL` | No | Logging verbosity (DEBUG, INFO, WARN, ERROR) |
 | `PORT` | No | Server port (default: 8080) |

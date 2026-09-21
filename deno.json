@@ -13,7 +13,7 @@
     "db:generate:key": "deno run ./src/db/generateKey.ts",
     "dev": "deno run --env --allow-net --allow-env --allow-read --allow-write --watch src/main.ts",
     "start": "deno run --allow-net --allow-env --allow-read --allow-write --cert ./ca-certificate.crt  src/main.ts",
-    "test": "deno test --env --allow-env"
+    "test": "deno test --env --allow-env --allow-read"
   },
   "compilerOptions": {
     "jsx": "precompile",
