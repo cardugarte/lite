@@ -2,10 +2,24 @@ import { bigint, index, integer, jsonb, pgTable, serial, text, timestamp } from 
 
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
-  encryptedConnectionSecret: text("connection_secret").notNull(),
+  encryptedConnectionSecret: text("connection_secret"),
   username: text("username").unique().notNull(),
   nostrPubkey: text("nostr_pubkey").notNull(),
+  destination: text("destination"),
+  sparkIdentityPubkey: text("spark_identity_pubkey"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export const rebindTokens = pgTable("rebind_tokens", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull(),
+  tokenHash: text("token_hash").unique().notNull(),
+  usedAt: timestamp("used_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (table) => {
+  return {
+    usernameIdx: index("rebind_tokens_username_idx").on(table.username),
+  };
 });
 
 export const invoices = pgTable("invoices", {

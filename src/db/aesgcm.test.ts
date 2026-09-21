@@ -1,3 +1,4 @@
+import "../test_setup.ts";
 import { expect } from "jsr:@std/expect";
 import { decrypt, encrypt } from "./aesgcm.ts";
 
@@ -30,6 +31,6 @@ Deno.test("cannot decrypt with incorrect key", async () => {
     // should never get here
     expect(true).toBe(false);
   } catch (error) {
-    expect(error.toString()).toEqual("OperationError: Decryption failed");
+    expect((error as Error).toString()).toEqual("OperationError: Decryption failed");
   }
 });

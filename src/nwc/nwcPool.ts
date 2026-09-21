@@ -6,31 +6,60 @@ import { NOSTR_NIP57_PRIVATE_KEY } from "../constants.ts";
 import { decrypt } from "../db/aesgcm.ts";
 import { DB } from "../db/db.ts";
 import { logger } from "../logger.ts";
+import { shouldSubscribeNwc } from "../spark/destination.ts";
+
+type NwcNotificationClient = {
+  subscribeNotifications(
+    callback: (notification: nwc.Nip47Notification) => Promise<void>,
+    types: Array<"payment_received">,
+  ): unknown;
+  close?: () => void;
+};
 
 export class NWCPool {
   private readonly _db: DB;
   private readonly pool: SimplePool;
   private readonly zapperPrivateKey: string;
+  private readonly decryptFn: (secret: string) => Promise<string>;
+  private readonly createClient: (connectionSecret: string) => NwcNotificationClient;
+  private readonly clients = new Map<number, NwcNotificationClient>();
 
-  constructor(db: DB) {
+  constructor(
+    db: DB,
+    decryptFn: (secret: string) => Promise<string> = decrypt,
+    createClient: (connectionSecret: string) => NwcNotificationClient = (connectionSecret) =>
+      new nwc.NWCClient({
+        nostrWalletConnectUrl: connectionSecret,
+      }),
+  ) {
     this._db = db;
     this.pool = new SimplePool()
     this.zapperPrivateKey = NOSTR_NIP57_PRIVATE_KEY;
+    this.decryptFn = decryptFn;
+    this.createClient = createClient;
   }
 
   async init() {
     const users = await this._db.getAllUsers();
     for (const user of users) {
-      const connectionSecret = await decrypt(user.encryptedConnectionSecret);
+      if (!shouldSubscribeNwc(user)) continue;
+      const connectionSecret = await this.decryptFn(user.encryptedConnectionSecret as string);
       this.subscribeUser(connectionSecret, user.id);
     }
   }
 
+  unsubscribeUser(userId: number) {
+    const existing = this.clients.get(userId);
+    if (!existing) return;
+    existing.close?.();
+    this.clients.delete(userId);
+  }
+
   subscribeUser(connectionSecret: string, userId: number) {
+    this.unsubscribeUser(userId);
     logger.debug("subscribing to user", { userId });
-    const nwcClient = new nwc.NWCClient({
-      nostrWalletConnectUrl: connectionSecret,
-    });
+    const nwcClient = this.createClient(connectionSecret);
+    this.clients.set(userId, nwcClient);
 
     nwcClient.subscribeNotifications(
       async (notification) => {
