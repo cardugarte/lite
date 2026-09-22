@@ -1,4 +1,4 @@
-FROM denoland/deno:2.1.2 AS builder
+FROM denoland/deno:2.9.7 AS builder
 WORKDIR /app
 COPY . .
 
@@ -6,6 +6,12 @@ RUN deno compile --allow-net --allow-read --allow-env --allow-write --include np
 
 FROM debian:bookworm-slim AS final
 WORKDIR /app
+
+# Coolify runs its HTTP healthcheck with curl (falling back to wget) inside the
+# container; the slim runtime image ships neither.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/main /app/main
 COPY --from=builder /app/drizzle /app/drizzle
