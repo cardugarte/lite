@@ -1,6 +1,10 @@
 import "../test_setup.ts";
 import { expect } from "jsr:@std/expect";
-import { createBreezSparkMinter, sparkReceiveWebhookUrl } from "./breezMinter.ts";
+import {
+  createBreezSparkMinter,
+  resolveSparkWebhookUrl,
+  sparkReceiveWebhookUrl,
+} from "./breezMinter.ts";
 
 const SPEC_INVOICE =
   "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
@@ -13,6 +17,29 @@ Deno.test("main.ts subscribes the minter webhook to the shipped handler", () => 
   expect(src.includes("resolveSparkWebhookUrl(BASE_URL")).toEqual(true);
   expect(src.includes("webhookSecret: SPARK_WEBHOOK_SECRET")).toEqual(true);
   expect(src.includes('hono.route("/spark/webhook"')).toEqual(true);
+});
+
+Deno.test("the minter webhook URL resolves from the importable BASE_URL", async () => {
+  const { BASE_URL } = await import("../constants.ts");
+  // Compile-time guard for src/main.ts:25: this fails to type-check if BASE_URL
+  // is typed `string | undefined` instead of the guaranteed present string.
+  const baseUrl: string = BASE_URL;
+  expect(resolveSparkWebhookUrl(baseUrl)).toEqual(sparkReceiveWebhookUrl(baseUrl));
+});
+
+Deno.test("readEnvValue treats missing and blank values as absent", async () => {
+  const { readEnvValue } = await import("../constants.ts");
+  expect(readEnvValue(undefined)).toEqual(undefined);
+  expect(readEnvValue("")).toEqual(undefined);
+  expect(readEnvValue("   ")).toEqual(undefined);
+  expect(readEnvValue("  http://lnaddr.test  ")).toEqual("http://lnaddr.test");
+});
+
+Deno.test("imported BASE_URL is a trimmed, non-blank string", async () => {
+  const { BASE_URL, readEnvValue } = await import("../constants.ts");
+  // A missing or blank env value never reaches the minter: the module exits first.
+  expect(readEnvValue(BASE_URL)).toEqual(BASE_URL);
+  expect(BASE_URL.trim()).toEqual(BASE_URL);
 });
 
 Deno.test("sparkReceiveWebhookUrl is BASE_URL plus /spark/webhook", () => {
