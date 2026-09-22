@@ -223,3 +223,114 @@ Deno.test("POST /users/rebind to NWC subscribes the new secret", async () => {
   expect(res.status).toEqual(200);
   expect(pool.subscribed).toEqual([{ secret: NWC_URL, userId: 8 }]);
 });
+
+const CREATE_BODY = {
+  sparkIdentityPubkey: SPARK_PUBKEY,
+  username: "alice",
+  nostrPubkey: NOSTR,
+};
+
+const REBIND_BODY = {
+  username: "alice",
+  nostrPubkey: NOSTR,
+  rebindToken: "tok",
+  sparkIdentityPubkey: SPARK_PUBKEY,
+};
+
+function originDb() {
+  const writes: string[] = [];
+  const db = {
+    createSparkUser: async () => {
+      writes.push("createSparkUser");
+      return { id: 9, username: "alice", nostrPubkey: NOSTR };
+    },
+    createUser: async () => {
+      writes.push("createUser");
+      return { id: 3, username: "alice", nostrPubkey: NOSTR };
+    },
+    rebindUser: async () => {
+      writes.push("rebindUser");
+      return { userId: 7, kind: "spark" as const };
+    },
+  } as unknown as DB;
+  return { db, writes };
+}
+
+Deno.test("POST /users and /rebind refuse a foreign Origin before any write", async () => {
+  const { db, writes } = originDb();
+  const app = createUsersApp(db, mockPool() as unknown as NWCPool);
+  const headers = {
+    "Content-Type": "application/json",
+    Origin: "https://evil.example",
+  };
+
+  const create = await app.request("/", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(CREATE_BODY),
+  });
+  const rebind = await app.request("/rebind", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(REBIND_BODY),
+  });
+
+  expect(create.status).toEqual(403);
+  expect(rebind.status).toEqual(403);
+  expect(writes).toEqual([]);
+});
+
+Deno.test("POST /users allows the apex and a travelsats.ar subdomain", async () => {
+  for (const origin of ["https://travelsats.ar", "https://app.travelsats.ar"]) {
+    const { db, writes } = originDb();
+    const app = createUsersApp(db, mockPool() as unknown as NWCPool);
+    const res = await app.request("/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: origin },
+      body: JSON.stringify(CREATE_BODY),
+    });
+    expect(res.status).toEqual(200);
+    expect(writes).toEqual(["createSparkUser"]);
+  }
+});
+
+Deno.test("POST /users/rebind allows the apex and a travelsats.ar subdomain", async () => {
+  for (const origin of ["https://travelsats.ar", "https://app.travelsats.ar"]) {
+    const { db, writes } = originDb();
+    const app = createUsersApp(db, mockPool() as unknown as NWCPool);
+    const res = await app.request("/rebind", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: origin },
+      body: JSON.stringify(REBIND_BODY),
+    });
+    expect(res.status).toEqual(200);
+    expect(writes).toEqual(["rebindUser"]);
+  }
+});
+
+Deno.test("POST /users with no Origin still creates the user", async () => {
+  const { db, writes } = originDb();
+  const app = createUsersApp(db, mockPool() as unknown as NWCPool);
+  const res = await app.request("/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(CREATE_BODY),
+  });
+  expect(res.status).toEqual(200);
+  expect(await res.json()).toEqual({ lightningAddress: "alice@lnaddr.test" });
+  expect(writes).toEqual(["createSparkUser"]);
+});
+
+Deno.test("lookalike hosts are not a travelsats.ar origin", async () => {
+  for (const origin of ["https://evil-travelsats.ar", "https://travelsats.ar.evil.example"]) {
+    const { db, writes } = originDb();
+    const app = createUsersApp(db, mockPool() as unknown as NWCPool);
+    const res = await app.request("/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: origin },
+      body: JSON.stringify(CREATE_BODY),
+    });
+    expect(res.status).toEqual(403);
+    expect(writes).toEqual([]);
+  }
+});
