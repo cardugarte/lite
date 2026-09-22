@@ -1,6 +1,6 @@
 ALTER TABLE "users" ALTER COLUMN "connection_secret" DROP NOT NULL;--> statement-breakpoint
-ALTER TABLE "users" ADD COLUMN "destination" text;--> statement-breakpoint
-ALTER TABLE "users" ADD COLUMN "spark_identity_pubkey" text;--> statement-breakpoint
+ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "destination" text;--> statement-breakpoint
+ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "spark_identity_pubkey" text;--> statement-breakpoint
 CREATE TABLE IF NOT EXISTS "rebind_tokens" (
 	"id" serial PRIMARY KEY NOT NULL,
 	"username" text NOT NULL,
