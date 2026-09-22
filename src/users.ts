@@ -6,7 +6,7 @@ import { DB } from "./db/db.ts";
 import { logger } from "./logger.ts";
 import { NWCPool } from "./nwc/nwcPool.ts";
 import { routeCreateUser } from "./spark/destination.ts";
-import { isAllowedUsersOrigin } from "./users-origin.ts";
+import { usersRequestAllowed } from "./users-origin.ts";
 import { isValid32ByteHex } from "./utils.ts";
 
 function normalizeNostrPubkey(nostrPubkey: string | undefined): string | null {
@@ -28,7 +28,11 @@ export function createUsersApp(db: DB, nwcPool: NWCPool) {
   const hono = new Hono();
 
   hono.post("/", async (c) => {
-    if (!isAllowedUsersOrigin(c.req.header("Origin"))) {
+    if (!usersRequestAllowed({
+      origin: c.req.header("Origin"),
+      registrationHeader: c.req.header("X-Travelsats-Registration"),
+      registrationSecret: Deno.env.get("TRAVELSATS_REGISTRATION_SECRET"),
+    })) {
       return c.text("origin not allowed", 403);
     }
     try {
@@ -83,7 +87,11 @@ export function createUsersApp(db: DB, nwcPool: NWCPool) {
   });
 
   hono.post("/rebind", async (c) => {
-    if (!isAllowedUsersOrigin(c.req.header("Origin"))) {
+    if (!usersRequestAllowed({
+      origin: c.req.header("Origin"),
+      registrationHeader: c.req.header("X-Travelsats-Registration"),
+      registrationSecret: Deno.env.get("TRAVELSATS_REGISTRATION_SECRET"),
+    })) {
       return c.text("origin not allowed", 403);
     }
     try {

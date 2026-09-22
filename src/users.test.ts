@@ -11,6 +11,11 @@ const SPARK_PUBKEY =
 const NWC_URL =
   "nostr+walletconnect://0ba9d3de7e3e201aad29ee6b9fca20da0e5fc638c4b0513671eaea9c16a3989f?relay=wss://relay.getalby.com/v1&secret=bdaec8619bcf63a7c797043092ef72a6f62270c0f832561faf8f51f0cfdfce33";
 
+const ALLOWED_BROWSER_HEADERS = {
+  "Content-Type": "application/json",
+  Origin: "https://travelsats.ar",
+};
+
 function postgresUniqueError() {
   const error = new postgres.PostgresError("duplicate key");
   (error as postgres.PostgresError & { constraint_name: string }).constraint_name =
@@ -53,7 +58,7 @@ Deno.test("POST /users spark path does not store or subscribe an NWC secret", as
   const app = createUsersApp(db, pool as unknown as NWCPool);
   const res = await app.request("/", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: ALLOWED_BROWSER_HEADERS,
     body: JSON.stringify({
       sparkIdentityPubkey: SPARK_PUBKEY,
       username: "alice",
@@ -88,7 +93,7 @@ Deno.test("POST /users NWC path still creates from a connection secret", async (
   const app = createUsersApp(db, pool as unknown as NWCPool);
   const res = await app.request("/", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: ALLOWED_BROWSER_HEADERS,
     body: JSON.stringify({
       connectionSecret: NWC_URL,
       username: "bob",
@@ -116,7 +121,7 @@ Deno.test("POST /users still rejects duplicate username", async () => {
 
   const sparkRes = await app.request("/", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: ALLOWED_BROWSER_HEADERS,
     body: JSON.stringify({
       sparkIdentityPubkey: SPARK_PUBKEY,
       username: "taken",
@@ -131,7 +136,7 @@ Deno.test("POST /users still rejects duplicate username", async () => {
 
   const nwcRes = await app.request("/", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: ALLOWED_BROWSER_HEADERS,
     body: JSON.stringify({
       connectionSecret: NWC_URL,
       username: "taken",
@@ -164,13 +169,13 @@ Deno.test("POST /users/rebind rejects replay of a used token", async () => {
   };
   const first = await app.request("/rebind", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: ALLOWED_BROWSER_HEADERS,
     body: JSON.stringify(body),
   });
   expect(first.status).toEqual(200);
   const second = await app.request("/rebind", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: ALLOWED_BROWSER_HEADERS,
     body: JSON.stringify(body),
   });
   expect(second.status).toEqual(200);
@@ -187,7 +192,7 @@ Deno.test("POST /users/rebind to Spark unsubscribes the leftover NWC client", as
   const app = createUsersApp(db, pool as unknown as NWCPool);
   const res = await app.request("/rebind", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: ALLOWED_BROWSER_HEADERS,
     body: JSON.stringify({
       username: "alice",
       nostrPubkey: NOSTR,
@@ -212,7 +217,7 @@ Deno.test("POST /users/rebind to NWC subscribes the new secret", async () => {
   const app = createUsersApp(db, pool as unknown as NWCPool);
   const res = await app.request("/rebind", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: ALLOWED_BROWSER_HEADERS,
     body: JSON.stringify({
       username: "alice",
       nostrPubkey: NOSTR,
@@ -240,13 +245,13 @@ const REBIND_BODY = {
 function originDb() {
   const writes: string[] = [];
   const db = {
-    createSparkUser: async () => {
+    createSparkUser: async (_sparkIdentityPubkey: string, username?: string) => {
       writes.push("createSparkUser");
-      return { id: 9, username: "alice", nostrPubkey: NOSTR };
+      return { id: 9, username: username || "alice", nostrPubkey: NOSTR };
     },
-    createUser: async () => {
+    createUser: async (_connectionSecret: string, username?: string) => {
       writes.push("createUser");
-      return { id: 3, username: "alice", nostrPubkey: NOSTR };
+      return { id: 3, username: username || "alice", nostrPubkey: NOSTR };
     },
     rebindUser: async () => {
       writes.push("rebindUser");
@@ -308,29 +313,127 @@ Deno.test("POST /users/rebind allows the apex and a travelsats.ar subdomain", as
   }
 });
 
-Deno.test("POST /users with no Origin still creates the user", async () => {
+async function expectNoWrite(
+  headers: Record<string, string>,
+  createBody: unknown = CREATE_BODY,
+  rebindBody: unknown = REBIND_BODY,
+) {
   const { db, writes } = originDb();
   const app = createUsersApp(db, mockPool() as unknown as NWCPool);
-  const res = await app.request("/", {
+  const create = await app.request("/", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(CREATE_BODY),
+    headers,
+    body: JSON.stringify(createBody),
   });
-  expect(res.status).toEqual(200);
-  expect(await res.json()).toEqual({ lightningAddress: "alice@lnaddr.test" });
-  expect(writes).toEqual(["createSparkUser"]);
-});
+  const rebind = await app.request("/rebind", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(rebindBody),
+  });
+  expect(create.status).toEqual(403);
+  expect(rebind.status).toEqual(403);
+  expect(writes).toEqual([]);
+}
 
 Deno.test("lookalike hosts are not a travelsats.ar origin", async () => {
   for (const origin of ["https://evil-travelsats.ar", "https://travelsats.ar.evil.example"]) {
-    const { db, writes } = originDb();
-    const app = createUsersApp(db, mockPool() as unknown as NWCPool);
-    const res = await app.request("/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Origin: origin },
-      body: JSON.stringify(CREATE_BODY),
+    await expectNoWrite({
+      "Content-Type": "application/json",
+      Origin: origin,
     });
-    expect(res.status).toEqual(403);
-    expect(writes).toEqual([]);
+  }
+});
+
+const NWC_CREATE_BODY = {
+  connectionSecret: NWC_URL,
+  username: "bob",
+  nostrPubkey: NOSTR,
+};
+
+const NWC_REBIND_BODY = {
+  username: "alice",
+  nostrPubkey: NOSTR,
+  rebindToken: "tok",
+  connectionSecret: NWC_URL,
+};
+
+Deno.test("POST /users and /rebind refuse a foreign Origin for an NWC body before any write", async () => {
+  await expectNoWrite(
+    {
+      "Content-Type": "application/json",
+      Origin: "https://evil.example",
+    },
+    NWC_CREATE_BODY,
+    NWC_REBIND_BODY,
+  );
+});
+
+const REGISTRATION_SECRET = "travelsats-registration-test-secret";
+
+function proxyHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "X-Travelsats-Registration": REGISTRATION_SECRET,
+    ...extra,
+  };
+}
+
+Deno.test("missing Origin without the registration credential does not write", async () => {
+  const previous = Deno.env.get("TRAVELSATS_REGISTRATION_SECRET");
+  Deno.env.set("TRAVELSATS_REGISTRATION_SECRET", REGISTRATION_SECRET);
+  try {
+    const headerSets: Record<string, string>[] = [
+      { "Content-Type": "application/json" },
+      { "Content-Type": "application/json", Origin: "" },
+      { "Content-Type": "application/json", Origin: "   " },
+      proxyHeaders({ "X-Travelsats-Registration": "wrong-secret" }),
+    ];
+    for (const headers of headerSets) {
+      await expectNoWrite(headers);
+      await expectNoWrite(headers, NWC_CREATE_BODY, NWC_REBIND_BODY);
+    }
+    Deno.env.delete("TRAVELSATS_REGISTRATION_SECRET");
+    await expectNoWrite(proxyHeaders());
+  } finally {
+    if (previous == null) Deno.env.delete("TRAVELSATS_REGISTRATION_SECRET");
+    else Deno.env.set("TRAVELSATS_REGISTRATION_SECRET", previous);
+  }
+});
+
+Deno.test("registration credential creates and rebinds Spark and NWC users without Origin", async () => {
+  const previous = Deno.env.get("TRAVELSATS_REGISTRATION_SECRET");
+  Deno.env.set("TRAVELSATS_REGISTRATION_SECRET", REGISTRATION_SECRET);
+  try {
+    const spark = originDb();
+    const sparkRes = await createUsersApp(spark.db, mockPool() as unknown as NWCPool).request(
+      "/",
+      { method: "POST", headers: proxyHeaders(), body: JSON.stringify(CREATE_BODY) },
+    );
+    expect(sparkRes.status).toEqual(200);
+    expect(spark.writes).toEqual(["createSparkUser"]);
+
+    const nwc = originDb();
+    const pool = mockPool();
+    const nwcRes = await createUsersApp(nwc.db, pool as unknown as NWCPool).request("/", {
+      method: "POST",
+      headers: proxyHeaders(),
+      body: JSON.stringify(NWC_CREATE_BODY),
+    });
+    expect(nwcRes.status).toEqual(200);
+    expect(nwc.writes).toEqual(["createUser"]);
+    expect(pool.subscribed).toEqual([{ secret: NWC_URL, userId: 3 }]);
+
+    const rebound = originDb();
+    const rebindRes = await createUsersApp(rebound.db, mockPool() as unknown as NWCPool).request(
+      "/rebind",
+      { method: "POST", headers: proxyHeaders(), body: JSON.stringify(REBIND_BODY) },
+    );
+    expect(rebindRes.status).toEqual(200);
+    expect(rebound.writes).toEqual(["rebindUser"]);
+
+    await expectNoWrite(proxyHeaders({ Origin: "https://evil.example" }));
+  } finally {
+    if (previous == null) Deno.env.delete("TRAVELSATS_REGISTRATION_SECRET");
+    else Deno.env.set("TRAVELSATS_REGISTRATION_SECRET", previous);
   }
 });
