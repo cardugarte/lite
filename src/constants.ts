@@ -2,11 +2,21 @@ import { getPublicKey } from "@nostr/tools";
 import { hexToBytes } from "npm:@noble/hashes@1.3.1/utils";
 
 export const PORT = parseInt(Deno.env.get("PORT") || "8080");
-export const BASE_URL = Deno.env.get("BASE_URL");
-if (!BASE_URL) {
+
+/** Trimmed value of an environment variable, or undefined when it is unset or blank. */
+export function readEnvValue(raw: string | undefined): string | undefined {
+  const value = raw?.trim();
+  return value ? value : undefined;
+}
+
+const baseUrl = readEnvValue(Deno.env.get("BASE_URL"));
+if (!baseUrl) {
   console.log("no BASE_URL provided, exiting");
   Deno.exit(1);
 }
+// Annotated so the guaranteed-present value is visible to importers (the guard
+// above runs at module load and exits before anything else can read it).
+export const BASE_URL: string = baseUrl;
 export const DOMAIN = BASE_URL.split("//")[1];
 const databaseUrl = Deno.env.get("DATABASE_URL");
 if (!databaseUrl) {
