@@ -368,32 +368,72 @@ Deno.test("POST /users and /rebind refuse a foreign Origin for an NWC body befor
   );
 });
 
-Deno.test("POST /users with a missing or empty Origin still registers Spark and NWC", async () => {
-  const headerSets: Record<string, string>[] = [
-    { "Content-Type": "application/json" },
-    { "Content-Type": "application/json", Origin: "" },
-    { "Content-Type": "application/json", Origin: "   " },
-  ];
-  for (const headers of headerSets) {
+const REGISTRATION_SECRET = "travelsats-registration-test-secret";
+
+function proxyHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "X-Travelsats-Registration": REGISTRATION_SECRET,
+    ...extra,
+  };
+}
+
+Deno.test("missing Origin without the registration credential does not write", async () => {
+  const previous = Deno.env.get("TRAVELSATS_REGISTRATION_SECRET");
+  Deno.env.set("TRAVELSATS_REGISTRATION_SECRET", REGISTRATION_SECRET);
+  try {
+    const headerSets: Record<string, string>[] = [
+      { "Content-Type": "application/json" },
+      { "Content-Type": "application/json", Origin: "" },
+      { "Content-Type": "application/json", Origin: "   " },
+      proxyHeaders({ "X-Travelsats-Registration": "wrong-secret" }),
+    ];
+    for (const headers of headerSets) {
+      await expectNoWrite(headers);
+      await expectNoWrite(headers, NWC_CREATE_BODY, NWC_REBIND_BODY);
+    }
+    Deno.env.delete("TRAVELSATS_REGISTRATION_SECRET");
+    await expectNoWrite(proxyHeaders());
+  } finally {
+    if (previous == null) Deno.env.delete("TRAVELSATS_REGISTRATION_SECRET");
+    else Deno.env.set("TRAVELSATS_REGISTRATION_SECRET", previous);
+  }
+});
+
+Deno.test("registration credential creates and rebinds Spark and NWC users without Origin", async () => {
+  const previous = Deno.env.get("TRAVELSATS_REGISTRATION_SECRET");
+  Deno.env.set("TRAVELSATS_REGISTRATION_SECRET", REGISTRATION_SECRET);
+  try {
     const spark = originDb();
     const sparkRes = await createUsersApp(spark.db, mockPool() as unknown as NWCPool).request(
       "/",
-      { method: "POST", headers, body: JSON.stringify(CREATE_BODY) },
+      { method: "POST", headers: proxyHeaders(), body: JSON.stringify(CREATE_BODY) },
     );
     expect(sparkRes.status).toEqual(200);
-    expect(await sparkRes.json()).toEqual({ lightningAddress: "alice@lnaddr.test" });
     expect(spark.writes).toEqual(["createSparkUser"]);
 
     const nwc = originDb();
     const pool = mockPool();
     const nwcRes = await createUsersApp(nwc.db, pool as unknown as NWCPool).request("/", {
       method: "POST",
-      headers,
+      headers: proxyHeaders(),
       body: JSON.stringify(NWC_CREATE_BODY),
     });
     expect(nwcRes.status).toEqual(200);
-    expect(await nwcRes.json()).toEqual({ lightningAddress: "bob@lnaddr.test" });
     expect(nwc.writes).toEqual(["createUser"]);
     expect(pool.subscribed).toEqual([{ secret: NWC_URL, userId: 3 }]);
+
+    const rebound = originDb();
+    const rebindRes = await createUsersApp(rebound.db, mockPool() as unknown as NWCPool).request(
+      "/rebind",
+      { method: "POST", headers: proxyHeaders(), body: JSON.stringify(REBIND_BODY) },
+    );
+    expect(rebindRes.status).toEqual(200);
+    expect(rebound.writes).toEqual(["rebindUser"]);
+
+    await expectNoWrite(proxyHeaders({ Origin: "https://evil.example" }));
+  } finally {
+    if (previous == null) Deno.env.delete("TRAVELSATS_REGISTRATION_SECRET");
+    else Deno.env.set("TRAVELSATS_REGISTRATION_SECRET", previous);
   }
 });
