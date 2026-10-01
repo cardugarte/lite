@@ -74,7 +74,7 @@ export function createLnurlApp(
           metadata,
         } as unknown as nwc.Nip47Transaction, {
           by: "spark",
-          receiverPubkey: user.sparkIdentityPubkey,
+          receiverPubkey: minted.receiverPubkey,
         });
         return c.json({
           verify: `${BASE_URL}/lnurlp/${username}/verify/${minted.paymentHash}`,

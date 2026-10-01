@@ -1,5 +1,6 @@
 import "../test_setup.ts";
 import { expect } from "jsr:@std/expect";
+import { captureLogs, entriesFor } from "../test_logs.ts";
 import {
   createBreezSparkMinter,
   resolveSparkWebhookUrl,
@@ -71,6 +72,9 @@ Deno.test("connects then registers SPARK_LIGHTNING_RECEIVE webhook before mintin
       connect: async () => {
         order.push("connect");
         return {
+          listWebhooks: async () => [],
+          unregisterWebhook: async () => {},
+          getInfo: async () => ({ balanceSats: 0 }),
           registerWebhook: async (request: {
             url: string;
             secret: string;
@@ -96,6 +100,7 @@ Deno.test("connects then registers SPARK_LIGHTNING_RECEIVE webhook before mintin
   });
 
   expect(order).toEqual(["connect", "registerWebhook", "receivePayment"]);
+  expect(minted.receiverPubkey).toEqual("02" + "ab".repeat(32));
   expect(webhookCalls).toEqual([{
     url: WEBHOOK_URL,
     secret: WEBHOOK_SECRET,
@@ -117,6 +122,9 @@ Deno.test("does not mint if webhook registration fails", async () => {
     loadBreez: async () => ({
       defaultConfig: () => ({ apiKey: undefined }),
       connect: async () => ({
+        listWebhooks: async () => [],
+          unregisterWebhook: async () => {},
+        getInfo: async () => ({ balanceSats: 0 }),
         registerWebhook: async () => {
           throw new Error("webhook subscribe failed");
         },
@@ -151,6 +159,9 @@ Deno.test("retries connect after a failed first sdk() instead of caching the rej
         connects += 1;
         if (connects === 1) throw new Error("ssp down");
         return {
+          listWebhooks: async () => [],
+          unregisterWebhook: async () => {},
+          getInfo: async () => ({ balanceSats: 0 }),
           registerWebhook: async () => ({ webhookId: "wh-2" }),
           receivePayment: async () => ({ paymentRequest: SPEC_INVOICE }),
         };
@@ -189,4 +200,228 @@ Deno.test("resolveSparkWebhookUrl prefers an explicit Fly origin over BASE_URL",
   expect(resolveSparkWebhookUrl("https://travelsats.ar")).toEqual(
     "https://travelsats.ar/spark/webhook",
   );
+});
+
+// ---------------------------------------------------------------------------
+// L10: the webhook is registered once, the minter has no LNURL client, and it
+// reports its balance.
+// ---------------------------------------------------------------------------
+
+const MNEMONIC = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const RECEIVER = "02" + "ab".repeat(32);
+
+type ListedWebhook = { id: string; url: string; eventTypes: Array<{ type: string }> };
+type Spies = {
+  connects: number;
+  lists: number;
+  registered: Array<{ url: string; secret: string; eventTypes: Array<{ type: string }> }>;
+  unregistered: string[];
+  configs: Array<Record<string, unknown>>;
+  paymentLookups: string[];
+};
+
+function sdkWorld(options: {
+  webhooks?: () => Promise<ListedWebhook[]>;
+  balance?: number;
+  defaultConfig?: Record<string, unknown>;
+  connectDelayMs?: number;
+} = {}) {
+  const spies: Spies = {
+    connects: 0,
+    lists: 0,
+    registered: [],
+    unregistered: [],
+    configs: [],
+    paymentLookups: [],
+  };
+  const loadBreez = async () => ({
+    defaultConfig: () => ({ apiKey: undefined, lnurlDomain: "breez.tips", ...options.defaultConfig }),
+    connect: async (opts: { config: Record<string, unknown> }) => {
+      spies.connects += 1;
+      spies.configs.push({ ...opts.config });
+      if (options.connectDelayMs) await new Promise((resolve) => setTimeout(resolve, options.connectDelayMs));
+      return {
+        listWebhooks: async () => {
+          spies.lists += 1;
+          return options.webhooks ? await options.webhooks() : [];
+        },
+        registerWebhook: async (request: Spies["registered"][number]) => {
+          spies.registered.push(request);
+          return { webhookId: "wh-new" };
+        },
+        unregisterWebhook: async (request: { webhookId: string }) => {
+          spies.unregistered.push(request.webhookId);
+        },
+        getInfo: async () => ({ balanceSats: options.balance ?? 0 }),
+        receivePayment: async () => ({ paymentRequest: SPEC_INVOICE }),
+        // The minter must never use these: settlement is webhook-only.
+        getPayment: async () => {
+          spies.paymentLookups.push("getPayment");
+          return {};
+        },
+        listPayments: async () => {
+          spies.paymentLookups.push("listPayments");
+          return { payments: [] };
+        },
+      };
+    },
+  });
+  const minter = () =>
+    createBreezSparkMinter({
+      apiKey: "test-api-key",
+      mnemonic: MNEMONIC,
+      webhookUrl: WEBHOOK_URL,
+      webhookSecret: WEBHOOK_SECRET,
+      loadBreez: loadBreez as never,
+    });
+  return { spies, minter };
+}
+
+const mint = (minter: ReturnType<typeof createBreezSparkMinter>) =>
+  minter.createInvoice({ receiverIdentityPubkey: RECEIVER, amountSats: 21, memo: "booking" });
+
+Deno.test("an empty webhook list registers once and logs spark_webhook_registered", async () => {
+  const { spies, minter } = sdkWorld();
+  const { entries } = await captureLogs(() => minter().connect!());
+  expect(spies.registered).toEqual([{
+    url: WEBHOOK_URL,
+    secret: WEBHOOK_SECRET,
+    eventTypes: [{ type: "lightningReceiveFinished" }],
+  }]);
+  expect(spies.unregistered).toEqual([]);
+  expect(entriesFor(entries, "spark_webhook_registered").length).toEqual(1);
+  expect(entriesFor(entries, "spark_webhook_stale")).toEqual([]);
+});
+
+Deno.test("an existing same-URL webhook is reused: no register, no unregister", async () => {
+  const { spies, minter } = sdkWorld({
+    webhooks: async () => [{ id: "w1", url: WEBHOOK_URL, eventTypes: [{ type: "lightningReceiveFinished" }] }],
+  });
+  const { entries, raw } = await captureLogs(() => minter().connect!());
+  expect(spies.registered).toEqual([]);
+  expect(spies.unregistered).toEqual([]);
+  expect(entriesFor(entries, "spark_webhook_already_registered").length).toEqual(1);
+  expect(raw).not.toContain(WEBHOOK_SECRET);
+});
+
+Deno.test("duplicate same-URL webhooks are trimmed to the first listed", async () => {
+  const { spies, minter } = sdkWorld({
+    webhooks: async () => [
+      { id: "w1", url: WEBHOOK_URL, eventTypes: [] },
+      { id: "w2", url: WEBHOOK_URL, eventTypes: [] },
+    ],
+  });
+  await captureLogs(() => minter().connect!());
+  expect(spies.unregistered).toEqual(["w2"]);
+  expect(spies.registered).toEqual([]);
+});
+
+Deno.test("other URLs are reported once and never deleted, and a different URL registers", async () => {
+  const { spies, minter } = sdkWorld({
+    webhooks: async () => [{ id: "stale-1", url: "https://other.example/spark/webhook", eventTypes: [] }],
+  });
+  const { entries } = await captureLogs(() => minter().connect!());
+  expect(spies.registered.length).toEqual(1);
+  expect(spies.unregistered).toEqual([]);
+  const stale = entriesFor(entries, "spark_webhook_stale");
+  expect(stale.length).toEqual(1);
+  expect(stale[0].level).toEqual("WARN");
+  expect(stale[0].args?.webhook_ids).toEqual(["stale-1"]);
+});
+
+Deno.test("a trailing-slash variant of the URL is another URL", async () => {
+  const { spies, minter } = sdkWorld({
+    webhooks: async () => [{ id: "slash", url: WEBHOOK_URL + "/", eventTypes: [] }],
+  });
+  const { entries } = await captureLogs(() => minter().connect!());
+  expect(spies.registered.length).toEqual(1);
+  expect(spies.unregistered).toEqual([]);
+  expect(entriesFor(entries, "spark_webhook_stale")[0].args?.webhook_ids).toEqual(["slash"]);
+});
+
+Deno.test("a restarted minter against a list that holds the webhook registers zero times", async () => {
+  const listed: ListedWebhook[] = [];
+  const { spies, minter } = sdkWorld({ webhooks: async () => listed });
+  await captureLogs(() => minter().connect!());
+  expect(spies.registered.length).toEqual(1);
+  listed.push({ id: "wh-new", url: WEBHOOK_URL, eventTypes: [{ type: "lightningReceiveFinished" }] });
+  await captureLogs(() => minter().connect!());
+  expect(spies.registered.length).toEqual(1);
+  expect(spies.connects).toEqual(2);
+});
+
+Deno.test("a rejecting listWebhooks rejects connect, never registers, and a later connect retries", async () => {
+  let failing = true;
+  const { spies, minter } = sdkWorld({
+    webhooks: async () => {
+      if (failing) throw new Error("ssp unavailable");
+      return [];
+    },
+  });
+  const instance = minter();
+  await expect(captureLogs(() => instance.connect!())).rejects.toThrow(/ssp unavailable/);
+  expect(spies.registered).toEqual([]);
+  failing = false;
+  await captureLogs(() => instance.connect!());
+  expect(spies.lists).toEqual(2);
+  expect(spies.registered.length).toEqual(1);
+  // The connected SDK is kept: only the webhook step is retried.
+  expect(spies.connects).toEqual(1);
+});
+
+Deno.test("two simultaneous createInvoice calls share one connect, one list, and one registration", async () => {
+  const { spies, minter } = sdkWorld({ connectDelayMs: 10 });
+  const instance = minter();
+  const [a, b] = await captureLogs(() => Promise.all([mint(instance), mint(instance)])).then((r) => r.result);
+  expect(a.invoice).toEqual(SPEC_INVOICE);
+  expect(b.invoice).toEqual(SPEC_INVOICE);
+  expect(spies.connects).toEqual(1);
+  expect(spies.lists).toEqual(1);
+  expect(spies.registered.length).toEqual(1);
+});
+
+Deno.test("the minter has no LNURL client even when the SDK default sets one", async () => {
+  const { spies, minter } = sdkWorld();
+  await captureLogs(() => minter().connect!());
+  expect(spies.configs.length).toEqual(1);
+  expect(spies.configs[0].lnurlDomain).toBeUndefined();
+  expect("lnurlDomain" in spies.configs[0]).toEqual(true);
+  expect(spies.configs[0].apiKey).toEqual("test-api-key");
+});
+
+Deno.test("connect logs the minter balance once", async () => {
+  const { minter } = sdkWorld({ balance: 1234 });
+  const { entries } = await captureLogs(() => minter().connect!());
+  const balance = entriesFor(entries, "spark_minter_balance");
+  expect(balance.length).toEqual(1);
+  expect(balance[0].args?.balanceSats).toEqual(1234);
+});
+
+Deno.test("a failing balance read never blocks connect or minting", async () => {
+  const instance = createBreezSparkMinter({
+    apiKey: "test-api-key",
+    mnemonic: MNEMONIC,
+    webhookUrl: WEBHOOK_URL,
+    webhookSecret: WEBHOOK_SECRET,
+    loadBreez: (async () => ({
+      defaultConfig: () => ({}),
+      connect: async () => ({
+        listWebhooks: async () => [],
+        registerWebhook: async () => ({ webhookId: "wh" }),
+        getInfo: async () => {
+          throw new Error("sync pending");
+        },
+        receivePayment: async () => ({ paymentRequest: SPEC_INVOICE }),
+      }),
+    })) as never,
+  });
+  const { result } = await captureLogs(() => mint(instance));
+  expect(result.invoice).toEqual(SPEC_INVOICE);
+});
+
+Deno.test("minting echoes the receiver key and never looks a payment up in the SDK", async () => {
+  const { spies, minter } = sdkWorld();
+  const { result } = await captureLogs(() => mint(minter()));
+  expect(result.receiverPubkey).toEqual(RECEIVER);
+  expect(spies.paymentLookups).toEqual([]);
 });

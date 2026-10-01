@@ -33,7 +33,7 @@ Deno.test("LNURL callback mints with the row identity pubkey and ignores request
   const minter: SparkMinter = {
     async createInvoice(input) {
       minted.push(input);
-      return { invoice: "lnbc1sparkinvoice", paymentHash: PAYMENT_HASH };
+      return { invoice: "lnbc1sparkinvoice", paymentHash: PAYMENT_HASH, receiverPubkey: ROW_PUBKEY };
     },
   };
   const db = {
@@ -465,4 +465,23 @@ Deno.test("verify logs spark_settlement_missing once per hash for an old unsettl
   expect(missing[0].args.payment_hash).toEqual("360");
   expect(missing[0].args.age_seconds).toEqual(360);
   expect(lines.join("\n")).not.toContain(PREIMAGE);
+});
+
+Deno.test("the mint records the receiver key the minter reports, not a value read from elsewhere", async () => {
+  const reported = "02dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+  const minter: SparkMinter = {
+    async createInvoice() {
+      return { invoice: "lnbc1sparkinvoice", paymentHash: PAYMENT_HASH, receiverPubkey: reported };
+    },
+  };
+  const written: Array<{ by: string; receiverPubkey?: string }> = [];
+  const db = {
+    findUser: async () => sparkUser(),
+    createInvoice: async (_userId: number, _tx: unknown, minted: { by: string; receiverPubkey?: string }) => {
+      written.push(minted);
+    },
+  } as unknown as DB;
+  const res = await createLnurlApp(db, minter).request("/alice/callback?amount=1000000");
+  expect(res.status).toEqual(200);
+  expect(written).toEqual([{ by: "spark", receiverPubkey: reported }]);
 });
