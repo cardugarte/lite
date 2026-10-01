@@ -2089,3 +2089,118 @@ Deno.test({
     });
   },
 });
+
+// ---------------------------------------------------------------------------
+// Spark webhook against the real database: write-once settlement (L9.2).
+// ---------------------------------------------------------------------------
+
+Deno.test({
+  name: "the webhook settles once from the server clock and concurrent deliveries write one settled_at",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const { hmac } = await import("npm:@noble/hashes@1.3.1/hmac");
+      const { sha256 } = await import("npm:@noble/hashes@1.3.1/sha256");
+      const { bytesToHex, hexToBytes } = await import("npm:@noble/hashes@1.3.1/utils");
+      const { createSparkWebhookApp } = await import("../spark/webhook.ts");
+      const secret = "integration-webhook-secret";
+      const preimage = "ab".repeat(32);
+      const paymentHash = bytesToHex(sha256(hexToBytes(preimage)));
+      const userId = await seedSpark(sql, "alice", NPUB, SPARK_KEY);
+      await db.createInvoice(userId, {
+        amount: 1000,
+        description: "spark",
+        invoice: "pr-webhook",
+        payment_hash: paymentHash,
+      } as never, { by: "spark", receiverPubkey: SPARK_KEY });
+
+      const payload = JSON.stringify({
+        type: "SPARK_LIGHTNING_RECEIVE_FINISHED",
+        payment_preimage: preimage,
+        request_status: "SUCCEEDED",
+        status: "TRANSFER_COMPLETED",
+        receiver_identity_public_key: SPARK_KEY.toUpperCase(),
+        timestamp: "2001-01-01T00:00:00Z",
+      });
+      const signature = bytesToHex(
+        hmac(sha256, new TextEncoder().encode(secret), new TextEncoder().encode(payload)),
+      );
+      const deliver = async (at: Date) => {
+        const app = createSparkWebhookApp(db, secret, () => at);
+        const res = await app.request("/", {
+          method: "POST",
+          headers: { "X-Spark-Signature": signature },
+          body: payload,
+        });
+        return { status: res.status, body: await res.text() };
+      };
+
+      const t1 = new Date("2026-03-10T10:00:00.000Z");
+      const t2 = new Date("2026-03-10T10:00:01.000Z");
+      const [a, b] = await Promise.all([deliver(t1), deliver(t2)]);
+      expect(a.status).toBe(200);
+      expect(b.status).toBe(200);
+      expect(a.body).toBe(b.body);
+
+      const settled = await db.findInvoice(paymentHash);
+      expect(settled.preimage).toBe(preimage);
+      expect([t1.getTime(), t2.getTime()]).toContain(settled.settledAt?.getTime());
+
+      // A later delivery changes nothing.
+      const third = await deliver(new Date("2026-03-10T11:00:00.000Z"));
+      expect(third.status).toBe(200);
+      const after = await db.findInvoice(paymentHash);
+      expect(after.settledAt?.getTime()).toBe(settled.settledAt?.getTime());
+      expect(after.preimage).toBe(preimage);
+    });
+  },
+});
+
+Deno.test({
+  name: "an NWC payment_received notification is write-once and cannot touch a Spark invoice",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const { NWCPool } = await import("../nwc/nwcPool.ts");
+      const nwcUserId = await seedNwc(sql, "bob", NPUB);
+      const sparkUserId = await seedSpark(sql, "alice", NPUB_OTHER, SPARK_KEY);
+      await db.createInvoice(nwcUserId, {
+        amount: 1000,
+        description: "nwc",
+        invoice: "pr-nwc-notify",
+        payment_hash: "hash-nwc-notify",
+      } as never, { by: "nwc" });
+      await db.createInvoice(sparkUserId, {
+        amount: 2000,
+        description: "spark",
+        invoice: "pr-spark-notify",
+        payment_hash: "hash-spark-notify",
+      } as never, { by: "spark", receiverPubkey: SPARK_KEY });
+
+      type Notify = (notification: unknown) => Promise<void>;
+      const callbacks = new Map<number, Notify>();
+      const pool = new NWCPool(db, async (secret) => secret, (url) => ({
+        subscribeNotifications: (callback: Notify) => void callbacks.set(Number(url), callback),
+        close: () => undefined,
+      } as never));
+      pool.subscribeUser(String(nwcUserId), nwcUserId);
+      pool.subscribeUser(String(sparkUserId), sparkUserId);
+
+      const notify = (userId: number, hash: string, preimage: string, settledAt: number) =>
+        callbacks.get(userId)!({
+          notification_type: "payment_received",
+          notification: { payment_hash: hash, preimage, settled_at: settledAt, invoice: "pr", amount: 1 },
+        });
+
+      await notify(nwcUserId, "hash-nwc-notify", "11".repeat(32), 1_700_000_000);
+      await notify(nwcUserId, "hash-nwc-notify", "22".repeat(32), 1_700_000_500);
+      expect((await db.findInvoice("hash-nwc-notify")).preimage).toBe("11".repeat(32));
+
+      // The Spark owner's NWC subscription (stale or hostile) reporting a preimage for a Spark invoice.
+      await notify(sparkUserId, "hash-spark-notify", "33".repeat(32), 1_700_000_000);
+      const sparkInvoice = await db.findInvoice("hash-spark-notify");
+      expect(sparkInvoice.preimage).toBeNull();
+      expect(sparkInvoice.settledAt).toBeNull();
+    });
+  },
+});

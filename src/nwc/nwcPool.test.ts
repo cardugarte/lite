@@ -71,3 +71,42 @@ Deno.test("subscribeUser replaces an existing subscription for the same userId",
   pool.unsubscribeUser(1);
   expect(closed).toEqual(["first", "second"]);
 });
+
+Deno.test("a payment_received notification settles only through the user-scoped write-once repository call", async () => {
+  const calls: Array<{ userId: number; paymentHash: string; preimage: string }> = [];
+  // Any other repository method would be undefined here and fail the test.
+  const db = {
+    getAllUsers: async () => [],
+    markInvoiceSettled: async (
+      userId: number,
+      transaction: { payment_hash: string; preimage: string },
+    ) => {
+      calls.push({ userId, paymentHash: transaction.payment_hash, preimage: transaction.preimage });
+    },
+  } as unknown as DB;
+  let deliver: ((notification: unknown) => Promise<void>) | undefined;
+  const pool = new NWCPool(
+    db,
+    async (secret) => secret,
+    () => ({
+      subscribeNotifications: (callback: (notification: never) => Promise<void>) => {
+        deliver = callback as (notification: unknown) => Promise<void>;
+      },
+      close: () => undefined,
+    }),
+  );
+  pool.subscribeUser("secret", 5);
+  await deliver!({
+    notification_type: "payment_received",
+    notification: { payment_hash: "hash-a", preimage: "11".repeat(32), settled_at: 1_700_000_000 },
+  });
+  await deliver!({
+    notification_type: "payment_received",
+    notification: { payment_hash: "hash-a", preimage: "22".repeat(32), settled_at: 1_700_000_500 },
+  });
+  await deliver!({ notification_type: "payment_sent", notification: { payment_hash: "hash-b" } });
+  expect(calls).toEqual([
+    { userId: 5, paymentHash: "hash-a", preimage: "11".repeat(32) },
+    { userId: 5, paymentHash: "hash-a", preimage: "22".repeat(32) },
+  ]);
+});

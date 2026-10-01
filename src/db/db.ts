@@ -444,29 +444,30 @@ export class DB {
     return;
   }
 
-  async markInvoiceSettledByPaymentHash(
-    paymentHash: string,
-    preimage: string,
-    settledAt: Date = new Date(),
-  ): Promise<void> {
-    await this._db
-      .update(invoices)
-      .set({
-        preimage,
-        settledAt,
-      })
-      .where(eq(invoices.paymentHash, paymentHash));
+  /** The invoice for a payment hash, or null. Unlike `findInvoice` it never hides a database error. */
+  async findInvoiceByPaymentHash(paymentHash: string) {
+    const [invoice] = await this._db
+      .select()
+      .from(invoices)
+      .where(eq(invoices.paymentHash, paymentHash))
+      .limit(1);
+    return invoice ?? null;
   }
 
+  /**
+   * Write-once settlement of a Spark-minted invoice: one conditional UPDATE
+   * that applies only while the preimage is NULL. `settledAt` is Lite's clock.
+   */
   async settleSparkInvoice(
     paymentHash: string,
     preimage: string,
+    settledAt: Date = new Date(),
   ): Promise<"settled" | "already_settled"> {
     const updated = await this._db
       .update(invoices)
       .set({
         preimage,
-        settledAt: new Date(),
+        settledAt,
       })
       .where(
         and(
