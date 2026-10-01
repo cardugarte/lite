@@ -3,11 +3,11 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { nwc } from "npm:@getalby/sdk";
 import postgres from "npm:postgres@3.4.5";
 
-import { and, eq, gt, isNull, lte, ne } from "drizzle-orm";
+import { and, eq, gt, isNull, lt, lte, ne } from "drizzle-orm";
 import { DATABASE_URL } from "../constants.ts";
 import { decrypt } from "./aesgcm.ts";
 import * as schema from "./schema.ts";
-import { bindingIntents, invoices, users } from "./schema.ts";
+import { bindingIntents, invoices, signedStatements, users } from "./schema.ts";
 
 export const DESTINATION = { NWC: "nwc", SPARK: "spark" } as const;
 export type Destination = (typeof DESTINATION)[keyof typeof DESTINATION];
@@ -52,6 +52,29 @@ function toUserRow(record: UserRecord): UserRow {
 export type CreateUserResult =
   | { kind: "created"; user: UserRow }
   | { kind: "conflict"; reason: "username_taken" | "account_exists" | "name_in_progress" };
+
+/** Single-use claim on a signed register statement. `expiresAt` is (ts + VALIDITY_SECS) seconds. */
+export interface StatementClaim {
+  hash: string;
+  route: "register";
+  expiresAt: Date;
+}
+
+export type RegisterResult =
+  | {
+    kind: "created" | "switched" | "rotated" | "unchanged";
+    user: UserRow;
+    previous: Destination | null;
+  }
+  | { kind: "no_intent" }
+  | { kind: "conflict"; reason: Exclude<Conflict, "name_in_progress"> };
+
+/** Thrown inside a transaction to roll it back and hand a result to the caller. */
+class Rollback<T> extends Error {
+  constructor(readonly result: T) {
+    super("rollback");
+  }
+}
 
 export type BindingIntentResult =
   | { kind: "ok"; expiresAt: Date }
@@ -124,6 +147,111 @@ export class DB {
         .where(and(eq(bindingIntents.nostrPubkey, npubHex), ne(bindingIntents.username, username)));
       return { kind: "ok", expiresAt } as const;
     });
+  }
+
+  /**
+   * The only way a Spark key is bound. One transaction, in this order: lock the
+   * active intent for the username (it must name this key), claim the signed
+   * statement, lock the account, username, and key rows and apply the row
+   * table, consume the intent. Every non-ok result rolls everything back, so a
+   * refused request burns neither the statement nor the intent.
+   */
+  async registerSparkAddress(input: {
+    username: string;
+    sparkPubkey: string;
+    statement: StatementClaim;
+    now: Date;
+  }): Promise<RegisterResult> {
+    const { username, sparkPubkey, statement, now } = input;
+    try {
+      return await this._db.transaction(async (tx): Promise<RegisterResult> => {
+        const [intent] = await tx
+          .select()
+          .from(bindingIntents)
+          .where(and(eq(bindingIntents.username, username), gt(bindingIntents.expiresAt, now)))
+          .for("update");
+        if (!intent || intent.sparkPubkey !== sparkPubkey) {
+          throw new Rollback<RegisterResult>({ kind: "no_intent" });
+        }
+        const npub = intent.nostrPubkey;
+
+        const claimed = await tx
+          .insert(signedStatements)
+          .values({
+            statementHash: statement.hash,
+            route: statement.route,
+            expiresAt: statement.expiresAt,
+          })
+          .onConflictDoNothing()
+          .returning({ hash: signedStatements.statementHash });
+        if (claimed.length === 0) {
+          throw new Rollback<RegisterResult>({ kind: "conflict", reason: CONFLICT.STATEMENT_USED });
+        }
+        await tx.delete(signedStatements).where(lt(signedStatements.expiresAt, now));
+
+        // Fixed lock order: account, username, key.
+        const lockUser = async (where: ReturnType<typeof eq>) => {
+          const [record] = await tx.select().from(users).where(where).limit(1).for("update");
+          return record ? toUserRow(record) : null;
+        };
+        const byAccount = await lockUser(eq(users.nostrPubkey, npub));
+        const byName = await lockUser(eq(users.username, username));
+        const byKey = await lockUser(eq(users.sparkIdentityPubkey, sparkPubkey));
+
+        const conflict = byName && byName.nostrPubkey !== npub
+          ? CONFLICT.NAME_TAKEN
+          : byAccount && byAccount.username !== username
+          ? CONFLICT.ACCOUNT_USERNAME_DIFFERS
+          : byKey && byKey.nostrPubkey !== npub
+          ? CONFLICT.PUBKEY_TAKEN
+          : null;
+        if (conflict) throw new Rollback<RegisterResult>({ kind: "conflict", reason: conflict });
+
+        let outcome: Exclude<RegisterResult, { kind: "no_intent" | "conflict" }>;
+        if (!byAccount) {
+          const [record] = await tx
+            .insert(users)
+            .values({
+              username,
+              nostrPubkey: npub,
+              destination: DESTINATION.SPARK,
+              sparkIdentityPubkey: sparkPubkey,
+              encryptedConnectionSecret: null,
+            })
+            .returning();
+          outcome = { kind: "created", user: toUserRow(record), previous: null };
+        } else if (byAccount.destination === DESTINATION.NWC) {
+          const [record] = await tx
+            .update(users)
+            .set({
+              destination: DESTINATION.SPARK,
+              sparkIdentityPubkey: sparkPubkey,
+              encryptedConnectionSecret: null,
+            })
+            .where(eq(users.id, byAccount.id))
+            .returning();
+          outcome = { kind: "switched", user: toUserRow(record), previous: DESTINATION.NWC };
+        } else if (byAccount.sparkIdentityPubkey === sparkPubkey) {
+          outcome = { kind: "unchanged", user: byAccount, previous: DESTINATION.SPARK };
+        } else {
+          const [record] = await tx
+            .update(users)
+            .set({ sparkIdentityPubkey: sparkPubkey })
+            .where(eq(users.id, byAccount.id))
+            .returning();
+          outcome = { kind: "rotated", user: toUserRow(record), previous: DESTINATION.SPARK };
+        }
+
+        await tx.delete(bindingIntents).where(eq(bindingIntents.username, username));
+        return outcome;
+      });
+    } catch (error) {
+      if (error instanceof Rollback) return error.result as RegisterResult;
+      const reason = uniqueViolationConflict(error);
+      if (reason === "username_taken") return { kind: "conflict", reason: CONFLICT.NAME_TAKEN };
+      if (reason === "pubkey_taken") return { kind: "conflict", reason: CONFLICT.PUBKEY_TAKEN };
+      throw error;
+    }
   }
 
   /**

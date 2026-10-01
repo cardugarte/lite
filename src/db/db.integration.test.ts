@@ -1573,3 +1573,471 @@ Deno.test({
     });
   },
 });
+
+// ---------------------------------------------------------------------------
+// registerSparkAddress (L5): intent -> claim -> rows -> consume, one transaction.
+// ---------------------------------------------------------------------------
+
+const REGISTER_TS = Math.floor(NOW.getTime() / 1000);
+
+function registerInput(
+  overrides: Partial<{
+    username: string;
+    sparkPubkey: string;
+    hash: string;
+    ts: number;
+    now: Date;
+  }> = {},
+) {
+  const ts = overrides.ts ?? REGISTER_TS;
+  return {
+    username: overrides.username ?? "alice",
+    sparkPubkey: overrides.sparkPubkey ?? SPARK_KEY,
+    statement: {
+      hash: overrides.hash ?? "hash-one",
+      route: "register" as const,
+      expiresAt: new Date((ts + 600) * 1000),
+    },
+    now: overrides.now ?? NOW,
+  };
+}
+
+async function claimRows(sql: Sql): Promise<{ statement_hash: string; expires_at: Date }[]> {
+  return await sql<{ statement_hash: string; expires_at: Date }[]>`
+    select statement_hash, expires_at from signed_statements order by statement_hash
+  `;
+}
+
+async function installUserWriteFailure(sql: Sql): Promise<void> {
+  await sql.unsafe(`
+    create function fail_users_write() returns trigger language plpgsql as $$
+    begin raise exception 'injected failure'; end $$
+  `);
+  await sql.unsafe(`
+    create trigger fail_users_write before insert or update on users
+    for each row execute function fail_users_write()
+  `);
+}
+
+async function clearUserWriteFailure(sql: Sql): Promise<void> {
+  await sql.unsafe("drop trigger fail_users_write on users");
+}
+
+async function seedActiveIntent(
+  sql: Sql,
+  overrides: Partial<{ username: string; nostrPubkey: string; sparkPubkey: string; expiresAt: Date }> = {},
+): Promise<void> {
+  await seedIntent(sql, {
+    username: overrides.username ?? "alice",
+    nostrPubkey: overrides.nostrPubkey ?? NPUB,
+    sparkPubkey: overrides.sparkPubkey ?? SPARK_KEY,
+    expiresAt: overrides.expiresAt ?? secondsFrom(NOW, 300),
+  });
+}
+
+Deno.test({
+  name: "registerSparkAddress answers no_intent without a claim or a row",
+  ignore: !databaseUrl,
+  async fn() {
+    // No intent at all.
+    await withRepo(async ({ sql, db }) => {
+      expect(await db.registerSparkAddress(registerInput())).toEqual({ kind: "no_intent" });
+      expect(await claimRows(sql)).toEqual([]);
+      expect((await sql`select 1 from users`).length).toBe(0);
+    });
+    // The intent expired one second ago.
+    await withRepo(async ({ sql, db }) => {
+      await seedActiveIntent(sql, { expiresAt: secondsFrom(NOW, -1) });
+      expect(await db.registerSparkAddress(registerInput())).toEqual({ kind: "no_intent" });
+      expect(await claimRows(sql)).toEqual([]);
+      expect((await sql`select 1 from users`).length).toBe(0);
+    });
+    // The intent names another key and stays untouched.
+    await withRepo(async ({ sql, db }) => {
+      await seedActiveIntent(sql, { sparkPubkey: SPARK_KEY_OTHER });
+      const before = await allIntents(sql);
+      expect(await db.registerSparkAddress(registerInput())).toEqual({ kind: "no_intent" });
+      expect(await allIntents(sql)).toEqual(before);
+      expect(await claimRows(sql)).toEqual([]);
+      expect((await sql`select 1 from users`).length).toBe(0);
+    });
+  },
+});
+
+Deno.test({
+  name: "registerSparkAddress rolls back every conflict: intent stays, no claim, no row change",
+  ignore: !databaseUrl,
+  async fn() {
+    const cases: Array<{
+      name: string;
+      seed: (sql: Sql) => Promise<void>;
+      reason: string;
+    }> = [
+      {
+        name: "row 1 name_taken",
+        seed: async (sql) => {
+          await seedNwc(sql, "alice", NPUB_OTHER);
+        },
+        reason: "name_taken",
+      },
+      {
+        name: "row 2 account_username_differs",
+        seed: async (sql) => {
+          await seedNwc(sql, "bob", NPUB);
+        },
+        reason: "account_username_differs",
+      },
+      {
+        name: "row 3 pubkey_taken",
+        seed: async (sql) => {
+          await seedSpark(sql, "carol", NPUB_OTHER, SPARK_KEY);
+        },
+        reason: "pubkey_taken",
+      },
+      {
+        name: "all three rows apply: name_taken wins",
+        seed: async (sql) => {
+          await seedNwc(sql, "alice", NPUB_OTHER);
+          await seedNwc(sql, "bob", NPUB);
+          await seedSpark(sql, "carol", NPUB_THIRD, SPARK_KEY);
+        },
+        reason: "name_taken",
+      },
+      {
+        name: "rows 2 and 3 apply: account_username_differs wins",
+        seed: async (sql) => {
+          await seedNwc(sql, "bob", NPUB);
+          await seedSpark(sql, "carol", NPUB_OTHER, SPARK_KEY);
+        },
+        reason: "account_username_differs",
+      },
+    ];
+    for (const scenario of cases) {
+      await withRepo(async ({ sql, db }) => {
+        await scenario.seed(sql);
+        await seedActiveIntent(sql);
+        const usersBefore = await userSnapshot(sql);
+        const intentsBefore = await allIntents(sql);
+
+        const result = await db.registerSparkAddress(registerInput());
+
+        expect(result).toEqual({ kind: "conflict", reason: scenario.reason as never });
+        expect(await claimRows(sql)).toEqual([]);
+        expect(await allIntents(sql)).toEqual(intentsBefore);
+        expect(await userSnapshot(sql)).toEqual(usersBefore);
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: "registerSparkAddress leaves the intent and no claim after an injected failure and succeeds on retry",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedActiveIntent(sql);
+      await installUserWriteFailure(sql);
+
+      let failed = false;
+      try {
+        await db.registerSparkAddress(registerInput());
+      } catch {
+        failed = true;
+      }
+      expect(failed).toBe(true);
+      expect(await claimRows(sql)).toEqual([]);
+      expect((await allIntents(sql)).length).toBe(1);
+      expect((await sql`select 1 from users`).length).toBe(0);
+
+      await clearUserWriteFailure(sql);
+      const retried = await db.registerSparkAddress(registerInput());
+      expect(retried.kind).toBe("created");
+      expect((await claimRows(sql)).length).toBe(1);
+    });
+  },
+});
+
+Deno.test({
+  name: "registerSparkAddress claims the statement until ts + 600 and refuses a replay",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedActiveIntent(sql);
+      const first = await db.registerSparkAddress(registerInput());
+      expect(first.kind).toBe("created");
+      expect(await allIntents(sql)).toEqual([]);
+      expect(await claimRows(sql)).toEqual([
+        { statement_hash: "hash-one", expires_at: new Date((REGISTER_TS + 600) * 1000) },
+      ]);
+
+      // Replay without a new intent: nothing to bind.
+      expect(await db.registerSparkAddress(registerInput())).toEqual({ kind: "no_intent" });
+      expect((await claimRows(sql)).length).toBe(1);
+
+      // Replay while a new intent exists: the statement is used, the intent remains.
+      const renewed = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY,
+        now: NOW,
+      });
+      expect(renewed.kind).toBe("ok");
+      expect(await db.registerSparkAddress(registerInput())).toEqual({
+        kind: "conflict",
+        reason: "statement_used",
+      });
+      expect((await allIntents(sql)).length).toBe(1);
+
+      // A fresh timestamp is a new statement.
+      const later = new Date(NOW.getTime() + 30_000);
+      const fresh = await db.registerSparkAddress(
+        registerInput({ hash: "hash-two", ts: REGISTER_TS + 30, now: later }),
+      );
+      expect(fresh.kind).toBe("unchanged");
+      expect((await claimRows(sql)).map((row) => row.statement_hash)).toEqual([
+        "hash-one",
+        "hash-two",
+      ]);
+      expect(await allIntents(sql)).toEqual([]);
+    });
+  },
+});
+
+Deno.test({
+  name: "registerSparkAddress prunes claims strictly before the clock and claims survive a new connection",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db, url }) => {
+      await sql`
+        insert into signed_statements (statement_hash, route, expires_at) values
+          ('old', 'register', ${secondsFrom(NOW, -1)}),
+          ('edge', 'register', ${NOW}),
+          ('live', 'register', ${secondsFrom(NOW, 60)})
+      `;
+      await seedActiveIntent(sql);
+      const result = await db.registerSparkAddress(registerInput({ hash: "hash-new" }));
+      expect(result.kind).toBe("created");
+
+      const other = postgres(url, { max: 1 });
+      try {
+        const rows = await other<{ statement_hash: string }[]>`
+          select statement_hash from signed_statements order by statement_hash
+        `;
+        expect(rows.map((row) => row.statement_hash)).toEqual(["edge", "hash-new", "live"]);
+      } finally {
+        await other.end({ timeout: 5 });
+      }
+    });
+  },
+});
+
+Deno.test({
+  name: "registerSparkAddress takes the account npub from the intent",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedActiveIntent(sql, { nostrPubkey: NPUB_THIRD });
+      const result = await db.registerSparkAddress(registerInput());
+      if (result.kind !== "created") throw new Error(`expected created, got ${result.kind}`);
+      expect(result.previous).toBeNull();
+      expect(result.user.nostrPubkey).toBe(NPUB_THIRD);
+      expect(result.user.destination).toBe("spark");
+      expect(result.user.sparkIdentityPubkey).toBe(SPARK_KEY);
+      expect(result.user.encryptedConnectionSecret).toBeNull();
+      const rows = await sql<{ nostr_pubkey: string }[]>`select nostr_pubkey from users`;
+      expect(rows).toEqual([{ nostr_pubkey: NPUB_THIRD }]);
+    });
+  },
+});
+
+Deno.test({
+  name: "registerSparkAddress switches an NWC row in place and consumes the intent",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const id = await seedNwc(sql, "alice", NPUB);
+      const [before] = await sql<{ created_at: Date }[]>`select created_at from users where id = ${id}`;
+      await seedActiveIntent(sql);
+
+      const result = await db.registerSparkAddress(registerInput());
+
+      if (result.kind !== "switched") throw new Error(`expected switched, got ${result.kind}`);
+      expect(result.previous).toBe("nwc");
+      expect(result.user.id).toBe(id);
+      const [row] = await sql<{
+        username: string;
+        destination: string;
+        connection_secret: string | null;
+        spark_identity_pubkey: string | null;
+        created_at: Date;
+      }[]>`select username, destination, connection_secret, spark_identity_pubkey, created_at from users`;
+      expect(row).toEqual({
+        username: "alice",
+        destination: "spark",
+        connection_secret: null,
+        spark_identity_pubkey: SPARK_KEY,
+        created_at: before.created_at,
+      });
+      expect(await allIntents(sql)).toEqual([]);
+    });
+  },
+});
+
+Deno.test({
+  name: "registerSparkAddress is a no-op for the same key and rotates a different key keeping the row id",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const id = await seedSpark(sql, "alice", NPUB, SPARK_KEY);
+
+      await seedActiveIntent(sql);
+      const unchanged = await db.registerSparkAddress(registerInput({ hash: "h-unchanged" }));
+      if (unchanged.kind !== "unchanged") throw new Error(`expected unchanged, got ${unchanged.kind}`);
+      expect(unchanged.previous).toBe("spark");
+      expect(unchanged.user.id).toBe(id);
+      expect(await allIntents(sql)).toEqual([]);
+
+      await seedActiveIntent(sql, { sparkPubkey: SPARK_KEY_OTHER });
+      const rotated = await db.registerSparkAddress(
+        registerInput({ hash: "h-rotated", sparkPubkey: SPARK_KEY_OTHER }),
+      );
+      if (rotated.kind !== "rotated") throw new Error(`expected rotated, got ${rotated.kind}`);
+      expect(rotated.previous).toBe("spark");
+      expect(rotated.user.id).toBe(id);
+      expect(rotated.user.sparkIdentityPubkey).toBe(SPARK_KEY_OTHER);
+      expect(await allIntents(sql)).toEqual([]);
+
+      // Rotation needs an intent like any other register.
+      expect(
+        await db.registerSparkAddress(
+          registerInput({ hash: "h-no-intent", sparkPubkey: SPARK_KEY_THIRD }),
+        ),
+      ).toEqual({ kind: "no_intent" });
+      const [row] = await sql<{ spark_identity_pubkey: string }[]>`select spark_identity_pubkey from users`;
+      expect(row.spark_identity_pubkey).toBe(SPARK_KEY_OTHER);
+    });
+  },
+});
+
+Deno.test({
+  name: "two simultaneous identical registers give one success, one no_intent, and exactly one claim",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedActiveIntent(sql);
+      const results = await Promise.all([
+        db.registerSparkAddress(registerInput()),
+        db.registerSparkAddress(registerInput()),
+      ]);
+      expect(results.map((result) => result.kind).sort()).toEqual(["created", "no_intent"]);
+      expect((await claimRows(sql)).length).toBe(1);
+      expect((await sql`select 1 from users`).length).toBe(1);
+    });
+  },
+});
+
+Deno.test({
+  name: "a register and an NWC bind at the same time both succeed and the row keeps one credential",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "alice", NPUB);
+      await seedActiveIntent(sql);
+      const [registered, bound] = await Promise.all([
+        db.registerSparkAddress(registerInput()),
+        db.bindNwcDestination(NPUB, "enc-concurrent", NOW),
+      ]);
+      expect(registered.kind).toBe("switched");
+      expect(bound.kind).toBe("bound");
+      const rows = await sql<{
+        destination: string;
+        connection_secret: string | null;
+        spark_identity_pubkey: string | null;
+      }[]>`select destination, connection_secret, spark_identity_pubkey from users`;
+      expect(rows.length).toBe(1);
+      const [row] = rows;
+      const credentials = [row.connection_secret, row.spark_identity_pubkey].filter((v) => v !== null);
+      expect(credentials.length).toBe(1);
+      expect(row.destination).toBe(row.connection_secret !== null ? "nwc" : "spark");
+    });
+  },
+});
+
+Deno.test({
+  name: "NWC to Spark to NWC to Spark keeps one row, one address, and one credential at every step",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const id = await seedNwc(sql, "alice", NPUB);
+      const [initial] = await sql<{ created_at: Date }[]>`select created_at from users where id = ${id}`;
+
+      async function expectOneRow(destination: "nwc" | "spark") {
+        const rows = await sql<{
+          id: number;
+          username: string;
+          created_at: Date;
+          destination: string;
+          connection_secret: string | null;
+          spark_identity_pubkey: string | null;
+        }[]>`select id, username, created_at, destination, connection_secret, spark_identity_pubkey from users`;
+        expect(rows.length).toBe(1);
+        const [row] = rows;
+        expect(row.id).toBe(id);
+        expect(row.username).toBe("alice");
+        expect(row.created_at).toEqual(initial.created_at);
+        expect(row.destination).toBe(destination);
+        expect(row.connection_secret === null).toBe(destination === "spark");
+        expect(row.spark_identity_pubkey === null).toBe(destination === "nwc");
+      }
+
+      let step = 0;
+      async function registerAgain() {
+        step += 1;
+        const at = new Date(NOW.getTime() + step * 1000);
+        const intent = await db.createBindingIntent({
+          npubHex: NPUB,
+          username: "alice",
+          sparkPubkey: SPARK_KEY,
+          now: at,
+        });
+        expect(intent.kind).toBe("ok");
+        return await db.registerSparkAddress(
+          registerInput({ hash: `hash-${step}`, ts: REGISTER_TS + step, now: at }),
+        );
+      }
+
+      expect((await registerAgain()).kind).toBe("switched");
+      await expectOneRow("spark");
+      expect((await db.bindNwcDestination(NPUB, "enc-back", NOW)).kind).toBe("bound");
+      await expectOneRow("nwc");
+      expect((await registerAgain()).kind).toBe("switched");
+      await expectOneRow("spark");
+    });
+  },
+});
+
+Deno.test({
+  name: "a failed register transaction leaves the NWC row, its intent, and no claim",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "alice", NPUB);
+      await seedActiveIntent(sql);
+      const usersBefore = await userSnapshot(sql);
+      await installUserWriteFailure(sql);
+
+      let failed = false;
+      try {
+        await db.registerSparkAddress(registerInput());
+      } catch {
+        failed = true;
+      }
+
+      expect(failed).toBe(true);
+      expect(await claimRows(sql)).toEqual([]);
+      expect((await allIntents(sql)).length).toBe(1);
+      await clearUserWriteFailure(sql);
+      expect(await userSnapshot(sql)).toEqual(usersBefore);
+    });
+  },
+});
