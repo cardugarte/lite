@@ -2,18 +2,14 @@ export function isSparkUser(user: {
   destination?: string | null;
   sparkIdentityPubkey?: string | null;
 }): boolean {
-  return user.destination === "spark" || Boolean(user.sparkIdentityPubkey);
+  return user.destination === "spark";
 }
 
 export function shouldSubscribeNwc(user: {
   destination?: string | null;
   encryptedConnectionSecret?: string | null;
 }): boolean {
-  if (user.destination === "spark") return false;
-  if (user.encryptedConnectionSecret == null || user.encryptedConnectionSecret === "") {
-    return false;
-  }
-  return true;
+  return user.destination === "nwc" && !!user.encryptedConnectionSecret;
 }
 
 export type CreateUserBody = {

@@ -63,7 +63,10 @@ export function createLnurlApp(db: DB, sparkMinter?: SparkMinter) {
           invoice: minted.invoice,
           payment_hash: minted.paymentHash,
           metadata,
-        } as unknown as nwc.Nip47Transaction);
+        } as unknown as nwc.Nip47Transaction, {
+          by: "spark",
+          receiverPubkey: user.sparkIdentityPubkey,
+        });
         return c.json({
           verify: `${BASE_URL}/lnurlp/${username}/verify/${minted.paymentHash}`,
           routes: [],
@@ -85,7 +88,7 @@ export function createLnurlApp(db: DB, sparkMinter?: SparkMinter) {
         metadata,
       });
 
-      await db.createInvoice(user.id, transaction);
+      await db.createInvoice(user.id, transaction, { by: "nwc" });
 
       return c.json({
         verify: `${BASE_URL}/lnurlp/${username}/verify/${transaction.payment_hash}`,

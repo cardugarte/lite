@@ -37,8 +37,12 @@ Deno.test("LNURL callback mints with the row identity pubkey and ignores request
   };
   const db = {
     findUser: async () => sparkUser(),
-    createInvoice: async (userId: number, transaction: { invoice: string }) => {
-      invoices.push({ userId, invoice: transaction.invoice });
+    createInvoice: async (
+      userId: number,
+      transaction: { invoice: string },
+      minted?: { by: string; receiverPubkey?: string },
+    ) => {
+      invoices.push({ userId, invoice: transaction.invoice, minted });
     },
   } as unknown as DB;
 
@@ -55,7 +59,11 @@ Deno.test("LNURL callback mints with the row identity pubkey and ignores request
   expect(minted).toEqual([
     { receiverIdentityPubkey: ROW_PUBKEY, amountSats: 2500, memo: "hi" },
   ]);
-  expect(invoices).toEqual([{ userId: 7, invoice: "lnbc1sparkinvoice" }]);
+  expect(invoices).toEqual([{
+    userId: 7,
+    invoice: "lnbc1sparkinvoice",
+    minted: { by: "spark", receiverPubkey: ROW_PUBKEY },
+  }]);
 });
 
 Deno.test("LUD-21 spark verify returns settled from persisted preimage without lookupInvoice", async () => {
@@ -167,17 +175,24 @@ Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invo
     } as nwc.Nip47Transaction;
   } as typeof nwc.NWCClient.prototype.makeInvoice;
 
-  const invoices: Array<{ userId: number; invoice: string; paymentHash: string }> = [];
+  const invoices: Array<{
+    userId: number;
+    invoice: string;
+    paymentHash: string;
+    minted?: { by: string; receiverPubkey?: string | null };
+  }> = [];
   const db = {
     findUser: async () => nwcUser(),
     createInvoice: async (
       userId: number,
       transaction: { invoice: string; payment_hash: string },
+      minted?: { by: string; receiverPubkey?: string | null },
     ) => {
       invoices.push({
         userId,
         invoice: transaction.invoice,
         paymentHash: transaction.payment_hash,
+        minted,
       });
     },
   } as unknown as DB;
@@ -200,6 +215,7 @@ Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invo
       userId: 3,
       invoice: "lnbc1nwcinvoice",
       paymentHash: PAYMENT_HASH,
+      minted: { by: "nwc" },
     }]);
   } finally {
     nwc.NWCClient.prototype.makeInvoice = original;

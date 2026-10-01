@@ -5,21 +5,9 @@ export const users = pgTable("users", {
   encryptedConnectionSecret: text("connection_secret"),
   username: text("username").unique().notNull(),
   nostrPubkey: text("nostr_pubkey").notNull(),
-  destination: text("destination"),
+  destination: text("destination").notNull(),
   sparkIdentityPubkey: text("spark_identity_pubkey"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
-});
-
-export const rebindTokens = pgTable("rebind_tokens", {
-  id: serial("id").primaryKey(),
-  username: text("username").notNull(),
-  tokenHash: text("token_hash").unique().notNull(),
-  usedAt: timestamp("used_at"),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-}, (table) => {
-  return {
-    usernameIdx: index("rebind_tokens_username_idx").on(table.username),
-  };
 });
 
 export const invoices = pgTable("invoices", {
@@ -32,10 +20,35 @@ export const invoices = pgTable("invoices", {
   preimage: text("preimage"),
   metadata: jsonb("metadata"),
   settledAt: timestamp("settled_at"),
+  mintedBy: text("minted_by").notNull(),
+  receiverPubkey: text("receiver_pubkey"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 }, (table) => {
   return {
     userIdIdx: index("user_id_idx").on(table.userId),
     userPaymentHashIdx: index("user_payment_hash_idx").on(table.userId, table.paymentHash),
+  };
+});
+
+export const bindingIntents = pgTable("binding_intents", {
+  username: text("username").primaryKey(),
+  nostrPubkey: text("nostr_pubkey").notNull(),
+  sparkPubkey: text("spark_pubkey").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => {
+  return {
+    expiresAtIdx: index("binding_intents_expires_at_idx").on(table.expiresAt),
+  };
+});
+
+export const signedStatements = pgTable("signed_statements", {
+  statementHash: text("statement_hash").primaryKey(),
+  route: text("route").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => {
+  return {
+    expiresAtIdx: index("signed_statements_expires_at_idx").on(table.expiresAt),
   };
 });

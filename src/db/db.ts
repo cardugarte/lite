@@ -3,7 +3,7 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { nwc } from "npm:@getalby/sdk";
 import postgres from "npm:postgres@3.4.5";
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { DATABASE_URL } from "../constants.ts";
 import { decrypt, encrypt } from "./aesgcm.ts";
 import * as schema from "./schema.ts";
@@ -33,17 +33,18 @@ export class DB {
     nostrPubkey?: string
   ) {
     parseNwcConnectionSecret(connectionSecret);
-    // TODO: use haikunator    
-    username = username || Math.floor(Math.random() * 100000000000).toString();
-    
-    const safeNostrPubkey = nostrPubkey || "";
-    
+    // TODO: use haikunator
+    username = (username || Math.floor(Math.random() * 100000000000).toString()).toLowerCase();
+
+    const safeNostrPubkey = (nostrPubkey || "").toLowerCase();
+
     const encryptedConnectionSecret = await encrypt(connectionSecret);
-    
+
     const [newUser] = await this._db.insert(users).values({
       encryptedConnectionSecret,
       username,
-      nostrPubkey: safeNostrPubkey
+      nostrPubkey: safeNostrPubkey,
+      destination: "nwc",
     }).returning({ id: users.id, username: users.username, nostrPubkey: users.nostrPubkey });
     
     return newUser;
@@ -75,7 +76,8 @@ export class DB {
 
   async createInvoice(
     userId: number,
-    transaction: nwc.Nip47Transaction
+    transaction: nwc.Nip47Transaction,
+    minted: { by: "nwc" } | { by: "spark"; receiverPubkey: string },
   ) {
     await this._db.insert(invoices).values({
       userId,
@@ -84,6 +86,8 @@ export class DB {
       paymentRequest: transaction.invoice,
       paymentHash: transaction.payment_hash,
       metadata: transaction.metadata,
+      mintedBy: minted.by,
+      receiverPubkey: minted.by === "spark" ? minted.receiverPubkey : null,
     });
 
     return;
@@ -112,7 +116,9 @@ export class DB {
       .where(
         and(
           eq(invoices.userId, userId),
-          eq(invoices.paymentHash, transaction.payment_hash)
+          eq(invoices.paymentHash, transaction.payment_hash),
+          eq(invoices.mintedBy, "nwc"),
+          isNull(invoices.preimage),
         )
       )
 
@@ -131,6 +137,27 @@ export class DB {
         settledAt,
       })
       .where(eq(invoices.paymentHash, paymentHash));
+  }
+
+  async settleSparkInvoice(
+    paymentHash: string,
+    preimage: string,
+  ): Promise<"settled" | "already_settled"> {
+    const updated = await this._db
+      .update(invoices)
+      .set({
+        preimage,
+        settledAt: new Date(),
+      })
+      .where(
+        and(
+          eq(invoices.paymentHash, paymentHash),
+          eq(invoices.mintedBy, "spark"),
+          isNull(invoices.preimage),
+        )
+      )
+      .returning({ id: invoices.id });
+    return updated.length > 0 ? "settled" : "already_settled";
   }
 
 }

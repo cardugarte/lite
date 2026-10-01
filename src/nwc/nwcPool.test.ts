@@ -19,10 +19,18 @@ Deno.test("nwcPool.init skips spark rows and never decrypts them", async () => {
       {
         id: 2,
         encryptedConnectionSecret: "enc-nwc",
-        destination: null,
+        destination: "nwc",
         sparkIdentityPubkey: null,
         username: "nwc",
         nostrPubkey: "bb".repeat(32),
+      },
+      {
+        id: 3,
+        encryptedConnectionSecret: "enc-null-dest",
+        destination: null,
+        sparkIdentityPubkey: "02ab",
+        username: "leftover",
+        nostrPubkey: "cc".repeat(32),
       },
     ],
   } as unknown as DB;
