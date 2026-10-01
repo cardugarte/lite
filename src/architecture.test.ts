@@ -73,3 +73,17 @@ Deno.test("rebind table names are absent outside drizzle", async () => {
   }
   expect(hits).toEqual([]);
 });
+
+const DOMAIN_IMPORT = /import\s*\{[^}]*\bDOMAIN\b[^}]*\}\s*from\s*"(?:\.{1,2}\/)+constants\.ts"/;
+
+Deno.test("no module imports the DOMAIN alias; addresses use LNURL_DOMAIN", async () => {
+  const src = new URL(".", import.meta.url);
+  const files = await typescriptFiles(decodeURIComponent(src.pathname));
+  const hits: string[] = [];
+  for (const file of files) {
+    if (file.endsWith(".test.ts") || file.endsWith("/constants.ts")) continue;
+    const text = await Deno.readTextFile(file);
+    if (DOMAIN_IMPORT.test(text)) hits.push(file);
+  }
+  expect(hits).toEqual([]);
+});

@@ -1,11 +1,11 @@
 import { Hono } from "hono";
-import { BASE_URL, DOMAIN, NOSTR_NIP57_PUBLIC_KEY } from "../constants.ts";
+import { BASE_URL, LNURL_DOMAIN, NOSTR_NIP57_PUBLIC_KEY } from "../constants.ts";
 import { DB } from "../db/db.ts";
 import { logger } from "../logger.ts";
 
 function getLnurlMetadata(username: string): string {
   return JSON.stringify([
-    ["text/identifier", `${username}@${DOMAIN}`],
+    ["text/identifier", `${username}@${LNURL_DOMAIN}`],
     ["text/plain", `Sats for ${username}`],
   ])
 }

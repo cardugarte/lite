@@ -1,9 +1,10 @@
 import "./test_setup.ts";
 import { expect } from "jsr:@std/expect";
+import { LNURL_DOMAIN } from "./constants.ts";
 import { decrypt } from "./db/aesgcm.ts";
 import type { DB } from "./db/db.ts";
 import { logger } from "./logger.ts";
-import type { NWCPool } from "./nwc/nwcPool.ts";
+import { NWCPool } from "./nwc/nwcPool.ts";
 import { createUsersApp } from "./users.ts";
 
 const NOSTR = "aa".repeat(32);
@@ -522,3 +523,429 @@ Deno.test("registration and authorization header values are not logged", async (
 });
 
 
+
+// ---------------------------------------------------------------------------
+// L7: create conflicts, binding intents, NWC bind, abandon, one LNURL domain.
+// ---------------------------------------------------------------------------
+
+const FIXED_NOW = new Date("2026-03-01T12:00:00.000Z");
+const NPUB_HEADER = "X-Travelsats-Nostr-Pubkey";
+
+function assertedHeaders(npub = NOSTR, extra: Record<string, string> = {}) {
+  return secretHeaders({ [NPUB_HEADER]: npub, ...extra });
+}
+
+async function callUsers(
+  db: DB,
+  method: string,
+  path: string,
+  headers: Record<string, string>,
+  body?: unknown,
+  pool = mockPool(),
+) {
+  const app = createUsersApp(db, pool as unknown as NWCPool, () => FIXED_NOW);
+  const payload = body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body);
+  const res = await app.request(path, { method, headers, body: payload });
+  return { res, pool };
+}
+
+function createdUser(id: number, username: string) {
+  return {
+    id,
+    username,
+    nostrPubkey: NOSTR,
+    destination: "nwc" as const,
+    sparkIdentityPubkey: null,
+    encryptedConnectionSecret: "enc",
+  };
+}
+
+// L7.1: POST /users conflicts ------------------------------------------------
+
+Deno.test("POST /users maps every repository conflict to its status and text", async () => {
+  await withSecret(SECRET, async () => {
+    const cases = [
+      { reason: "username_taken", text: "Username has already been taken" },
+      { reason: "account_exists", text: "Account already has a Lightning Address" },
+      { reason: "name_in_progress", text: "name is being registered" },
+    ];
+    for (const item of cases) {
+      const db = {
+        createUser: async () => ({ kind: "conflict", reason: item.reason }),
+      } as unknown as DB;
+      const { res, pool } = await callUsers(db, "POST", "/", secretHeaders(), nwcBody());
+      expect(res.status).toEqual(409);
+      expect(await res.json()).toEqual({ status: "ERROR", reason: item.text });
+      expect(pool.subscribed).toEqual([]);
+    }
+  });
+});
+
+Deno.test("POST /users answers the first conflict in table order when several apply", async () => {
+  await withSecret(SECRET, async () => {
+    const state = { usernameTaken: true, accountExists: true, foreignIntent: true };
+    const db = {
+      createUser: async () => {
+        if (state.usernameTaken) return { kind: "conflict", reason: "username_taken" };
+        if (state.accountExists) return { kind: "conflict", reason: "account_exists" };
+        if (state.foreignIntent) return { kind: "conflict", reason: "name_in_progress" };
+        return { kind: "created", user: createdUser(1, "alice") };
+      },
+    } as unknown as DB;
+    const reasons: string[] = [];
+    for (const step of ["usernameTaken", "accountExists", "foreignIntent"] as const) {
+      const { res } = await callUsers(db, "POST", "/", secretHeaders(), nwcBody());
+      reasons.push((await res.json()).reason);
+      state[step] = false;
+    }
+    expect(reasons).toEqual([
+      "Username has already been taken",
+      "Account already has a Lightning Address",
+      "name is being registered",
+    ]);
+    const { res } = await callUsers(db, "POST", "/", secretHeaders(), nwcBody());
+    expect(res.status).toEqual(200);
+  });
+});
+
+Deno.test("POST /users hands the repository a lowercase account, a lowercase name, and the clock", async () => {
+  await withSecret(SECRET, async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const db = {
+      createUser: async (input: Record<string, unknown>) => {
+        seen.push(input);
+        return { kind: "created", user: createdUser(4, "alice") };
+      },
+    } as unknown as DB;
+    const { res, pool } = await callUsers(
+      db,
+      "POST",
+      "/",
+      secretHeaders(),
+      nwcBody("Alice", NOSTR.toUpperCase()),
+    );
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({ lightningAddress: `alice@${LNURL_DOMAIN}` });
+    expect(seen.length).toEqual(1);
+    expect(seen[0].npubHex).toEqual(NOSTR);
+    expect(seen[0].username).toEqual("alice");
+    expect(seen[0].now).toEqual(FIXED_NOW);
+    expect(await decrypt(seen[0].encryptedSecret as string)).toEqual(NWC_URL);
+    expect(pool.subscribed).toEqual([{ secret: NWC_URL, userId: 4 }]);
+  });
+});
+
+// L7.2: POST /users/binding-intents -----------------------------------------
+
+function intentRepo(result: unknown = { kind: "ok", expiresAt: new Date("2026-03-01T12:10:00.000Z") }) {
+  const calls: Array<Record<string, unknown>> = [];
+  const db = {
+    createBindingIntent: async (input: Record<string, unknown>) => {
+      calls.push(input);
+      if (result instanceof Error) throw result;
+      return result;
+    },
+  } as unknown as DB;
+  return { db, calls };
+}
+
+const intentBody = (overrides: Record<string, unknown> = {}) => ({
+  username: "alice",
+  sparkPubkey: SPARK_PUBKEY,
+  ...overrides,
+});
+
+Deno.test("POST /users/binding-intents needs the secret before anything else", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, calls } = intentRepo();
+    const noSecret = await callUsers(db, "POST", "/binding-intents", { "Content-Type": "application/json" }, "not json");
+    expect(noSecret.res.status).toEqual(403);
+    const wrong = await callUsers(
+      db,
+      "POST",
+      "/binding-intents",
+      { "X-Travelsats-Registration": "nope", [NPUB_HEADER]: NOSTR },
+      intentBody(),
+    );
+    expect(wrong.res.status).toEqual(403);
+    expect(calls).toEqual([]);
+  });
+  await withSecret(undefined, async () => {
+    const { db, calls } = intentRepo();
+    const { res } = await callUsers(db, "POST", "/binding-intents", assertedHeaders(), intentBody());
+    expect(res.status).toEqual(503);
+    expect(calls).toEqual([]);
+  });
+});
+
+Deno.test("POST /users/binding-intents rejects a missing or malformed npub assertion", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, calls } = intentRepo();
+    for (const headers of [secretHeaders(), assertedHeaders("aa".repeat(31) + "a"), assertedHeaders("zz".repeat(32))]) {
+      const { res } = await callUsers(db, "POST", "/binding-intents", headers, intentBody());
+      expect(res.status).toEqual(400);
+      expect(await res.json()).toEqual({ status: "ERROR", reason: "missing or invalid npub assertion" });
+    }
+    expect(calls).toEqual([]);
+  });
+});
+
+Deno.test("POST /users/binding-intents validates the body and creates nothing on rejection", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, calls } = intentRepo();
+    const cases: Array<{ body: unknown; status: number; reason: string }> = [
+      { body: "not json", status: 400, reason: "invalid json" },
+      { body: "[]", status: 400, reason: "invalid request" },
+      { body: "null", status: 400, reason: "invalid request" },
+      { body: intentBody({ sparkPubkey: SPARK_PUBKEY.toUpperCase().replace(/^0/, "0") }), status: 400, reason: "invalid sparkPubkey" },
+      { body: intentBody({ sparkPubkey: "04" + "ab".repeat(32) }), status: 400, reason: "invalid sparkPubkey" },
+      { body: intentBody({ sparkPubkey: 42 }), status: 400, reason: "invalid sparkPubkey" },
+      { body: intentBody({ username: "has space" }), status: 400, reason: "invalid username" },
+      { body: intentBody({ username: "a..b" }), status: 400, reason: "invalid username" },
+      { body: intentBody({ username: "   " }), status: 400, reason: "invalid username" },
+      { body: intentBody({ username: 7 }), status: 400, reason: "invalid username" },
+      { body: intentBody({ username: "a".repeat(65) }), status: 400, reason: "username too long" },
+    ];
+    for (const item of cases) {
+      const { res } = await callUsers(db, "POST", "/binding-intents", assertedHeaders(), item.body);
+      expect(res.status).toEqual(item.status);
+      expect(await res.json()).toEqual({ status: "ERROR", reason: item.reason });
+    }
+    expect(calls).toEqual([]);
+  });
+});
+
+Deno.test("POST /users/binding-intents lowercases the account and name and answers expiresAt", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, calls } = intentRepo();
+    const { res } = await callUsers(
+      db,
+      "POST",
+      "/binding-intents",
+      assertedHeaders(NOSTR.toUpperCase()),
+      intentBody({ username: "  Alice ", nostrPubkey: OTHER_NOSTR }),
+    );
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({ expiresAt: "2026-03-01T12:10:00.000Z" });
+    expect(calls).toEqual([{ npubHex: NOSTR, username: "alice", sparkPubkey: SPARK_PUBKEY, now: FIXED_NOW }]);
+    expect(res.headers.get("access-control-allow-origin")).toBeNull();
+  });
+});
+
+Deno.test("POST /users/binding-intents maps each conflict row to its exact reason", async () => {
+  await withSecret(SECRET, async () => {
+    const cases = [
+      ["name_taken", "name already taken"],
+      ["account_username_differs", "account holds a different username"],
+      ["pubkey_taken", "pubkey already holds an address"],
+      ["name_in_progress", "name is being registered"],
+    ];
+    for (const [reason, text] of cases) {
+      const { db } = intentRepo({ kind: "conflict", reason });
+      const { res } = await callUsers(db, "POST", "/binding-intents", assertedHeaders(), intentBody());
+      expect(res.status).toEqual(409);
+      expect(await res.json()).toEqual({ status: "ERROR", reason: text });
+    }
+  });
+});
+
+Deno.test("POST /users/binding-intents answers an opaque 500 on a repository failure", async () => {
+  await withSecret(SECRET, async () => {
+    const { db } = intentRepo(new Error("connection refused: postgres://u:p@host"));
+    const { res } = await callUsers(db, "POST", "/binding-intents", assertedHeaders(), intentBody());
+    expect(res.status).toEqual(500);
+    expect(await res.json()).toEqual({ status: "ERROR", reason: "internal error" });
+  });
+});
+
+Deno.test("GET /users/binding-intents exposes nothing", async () => {
+  await withSecret(SECRET, async () => {
+    const { db } = intentRepo();
+    const { res } = await callUsers(db, "GET", "/binding-intents", assertedHeaders());
+    expect(res.status).toEqual(404);
+    const text = await res.text();
+    expect(text.includes("expiresAt")).toEqual(false);
+    expect(text.includes(SPARK_PUBKEY)).toEqual(false);
+  });
+});
+
+// L7.3: POST /users/nwc-bind -------------------------------------------------
+
+function bindRepo(result: unknown) {
+  const calls: Array<{ npubHex: string; encryptedSecret: string; now: Date }> = [];
+  const db = {
+    bindNwcDestination: async (npubHex: string, encryptedSecret: string, now: Date) => {
+      calls.push({ npubHex, encryptedSecret, now });
+      return result;
+    },
+  } as unknown as DB;
+  return { db, calls };
+}
+
+const boundResult = (id: number, username = "alice") => ({
+  kind: "bound",
+  user: { ...createdUser(id, username), destination: "nwc" },
+});
+
+Deno.test("POST /users/nwc-bind moves the account to NWC with an encrypted secret and subscribes the row", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, calls } = bindRepo(boundResult(7));
+    const { res, pool } = await callUsers(
+      db,
+      "POST",
+      "/nwc-bind",
+      assertedHeaders(NOSTR.toUpperCase()),
+      { connectionSecret: NWC_URL },
+    );
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({ lightningAddress: `alice@${LNURL_DOMAIN}` });
+    expect(calls.length).toEqual(1);
+    expect(calls[0].npubHex).toEqual(NOSTR);
+    expect(calls[0].now).toEqual(FIXED_NOW);
+    expect(calls[0].encryptedSecret).not.toEqual(NWC_URL);
+    expect(await decrypt(calls[0].encryptedSecret)).toEqual(NWC_URL);
+    expect(pool.subscribed).toEqual([{ secret: NWC_URL, userId: 7 }]);
+  });
+});
+
+Deno.test("POST /users/nwc-bind replaces the subscription of an NWC row with one for the new secret", async () => {
+  await withSecret(SECRET, async () => {
+    const created: string[] = [];
+    let closed = 0;
+    const pool = new NWCPool({} as unknown as DB, decrypt, (secret) => {
+      created.push(secret);
+      return { subscribeNotifications() {}, close: () => { closed += 1; } };
+    });
+    const OLD_URL = NWC_URL.replace("bdaec861", "cafebabe");
+    pool.subscribeUser(OLD_URL, 7);
+    const { db } = bindRepo(boundResult(7));
+    const app = createUsersApp(db, pool, () => FIXED_NOW);
+    const res = await app.request("/nwc-bind", {
+      method: "POST",
+      headers: assertedHeaders(),
+      body: JSON.stringify({ connectionSecret: NWC_URL }),
+    });
+    expect(res.status).toEqual(200);
+    expect(created).toEqual([OLD_URL, NWC_URL]);
+    expect(closed).toEqual(1);
+  });
+});
+
+Deno.test("POST /users/nwc-bind answers 404 for an unknown account and 409 for a name in progress", async () => {
+  await withSecret(SECRET, async () => {
+    const missing = bindRepo({ kind: "not_found" });
+    const notFound = await callUsers(missing.db, "POST", "/nwc-bind", assertedHeaders(), { connectionSecret: NWC_URL });
+    expect(notFound.res.status).toEqual(404);
+    expect(await notFound.res.json()).toEqual({ status: "ERROR", reason: "user not found" });
+    expect(notFound.pool.subscribed).toEqual([]);
+
+    const busy = bindRepo({ kind: "conflict", reason: "name_in_progress" });
+    const conflict = await callUsers(busy.db, "POST", "/nwc-bind", assertedHeaders(), { connectionSecret: NWC_URL });
+    expect(conflict.res.status).toEqual(409);
+    expect(await conflict.res.json()).toEqual({ status: "ERROR", reason: "name is being registered" });
+    expect(conflict.pool.subscribed).toEqual([]);
+  });
+});
+
+Deno.test("POST /users/nwc-bind validates the secret before touching the row", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, calls } = bindRepo(boundResult(7));
+    const noSecretUri = "nostr+walletconnect://0ba9d3de7e3e201aad29ee6b9fca20da0e5fc638c4b0513671eaea9c16a3989f?relay=wss://relay.getalby.com/v1";
+    const invalid = await callUsers(db, "POST", "/nwc-bind", assertedHeaders(), { connectionSecret: noSecretUri });
+    expect(invalid.res.status).toEqual(400);
+    expect((await invalid.res.json()).status).toEqual("ERROR");
+    const missing = await callUsers(db, "POST", "/nwc-bind", assertedHeaders(), {});
+    expect(missing.res.status).toEqual(400);
+    expect(await missing.res.json()).toEqual({ status: "ERROR", reason: "no connection secret provided" });
+    const notJson = await callUsers(db, "POST", "/nwc-bind", assertedHeaders(), "not json");
+    expect(notJson.res.status).toEqual(400);
+    expect(await notJson.res.json()).toEqual({ status: "ERROR", reason: "invalid json" });
+    expect(calls).toEqual([]);
+  });
+});
+
+Deno.test("POST /users/nwc-bind checks the secret, then the npub header, and ignores other body keys", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, calls } = bindRepo(boundResult(7));
+    const noSecret = await callUsers(db, "POST", "/nwc-bind", { "Content-Type": "application/json", [NPUB_HEADER]: NOSTR }, { connectionSecret: NWC_URL });
+    expect(noSecret.res.status).toEqual(403);
+    const noNpub = await callUsers(db, "POST", "/nwc-bind", secretHeaders(), { connectionSecret: NWC_URL });
+    expect(noNpub.res.status).toEqual(400);
+    expect(await noNpub.res.json()).toEqual({ status: "ERROR", reason: "missing or invalid npub assertion" });
+    expect(calls).toEqual([]);
+
+    const { res } = await callUsers(db, "POST", "/nwc-bind", assertedHeaders(), {
+      connectionSecret: NWC_URL,
+      nostrPubkey: OTHER_NOSTR,
+      username: "mallory",
+      destination: "spark",
+    });
+    expect(res.status).toEqual(200);
+    expect(calls.map((call) => call.npubHex)).toEqual([NOSTR]);
+  });
+  await withSecret(undefined, async () => {
+    const { db } = bindRepo(boundResult(7));
+    const { res } = await callUsers(db, "POST", "/nwc-bind", assertedHeaders(), { connectionSecret: NWC_URL });
+    expect(res.status).toEqual(503);
+  });
+});
+
+// L7.4: DELETE /users --------------------------------------------------------
+
+function abandonRepo(existing: { id: number } | null, removed: number) {
+  const events: string[] = [];
+  const db = {
+    findUserByNostrPubkey: async (npub: string) => {
+      events.push(`find:${npub}`);
+      return existing;
+    },
+    deleteUserByNostrPubkey: async (npub: string) => {
+      events.push(`delete:${npub}`);
+      return removed;
+    },
+  } as unknown as DB;
+  return { db, events };
+}
+
+Deno.test("DELETE /users removes only the asserted account and cancels its subscription after the delete", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, events } = abandonRepo({ id: 5 }, 1);
+    const pool = mockPool();
+    const original = pool.unsubscribeUser.bind(pool);
+    pool.unsubscribeUser = (userId: number) => {
+      events.push(`unsubscribe:${userId}`);
+      original(userId);
+    };
+    const { res } = await callUsers(db, "DELETE", "/", assertedHeaders(NOSTR.toUpperCase()), undefined, pool);
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({ removed: 1 });
+    expect(events).toEqual([`find:${NOSTR}`, `delete:${NOSTR}`, "unsubscribe:5"]);
+  });
+});
+
+Deno.test("DELETE /users answers removed 0 for an account without a row and keeps subscriptions", async () => {
+  await withSecret(SECRET, async () => {
+    const { db } = abandonRepo(null, 0);
+    const { res, pool } = await callUsers(db, "DELETE", "/", assertedHeaders());
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({ removed: 0 });
+    expect(pool.unsubscribed).toEqual([]);
+  });
+});
+
+Deno.test("DELETE /users needs the secret and then the npub header", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, events } = abandonRepo({ id: 5 }, 1);
+    const noSecret = await callUsers(db, "DELETE", "/", { [NPUB_HEADER]: NOSTR });
+    expect(noSecret.res.status).toEqual(403);
+    const noNpub = await callUsers(db, "DELETE", "/", secretHeaders());
+    expect(noNpub.res.status).toEqual(400);
+    expect(await noNpub.res.json()).toEqual({ status: "ERROR", reason: "missing or invalid npub assertion" });
+    expect(events).toEqual([]);
+  });
+  await withSecret(undefined, async () => {
+    const { db } = abandonRepo({ id: 5 }, 1);
+    const { res } = await callUsers(db, "DELETE", "/", assertedHeaders());
+    expect(res.status).toEqual(503);
+  });
+});
