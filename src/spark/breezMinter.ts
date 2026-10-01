@@ -40,7 +40,8 @@ export function sparkReceiveWebhookUrl(baseUrl: string): string {
 
 export function resolveSparkWebhookUrl(baseUrl: string, override?: string): string {
   if (override && override.trim()) {
-    return override.replace(/\/$/, "");
+    // Compared as an exact string against the registered webhooks: never rewritten.
+    return override.trim();
   }
   return sparkReceiveWebhookUrl(baseUrl);
 }

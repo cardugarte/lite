@@ -949,3 +949,17 @@ Deno.test("DELETE /users needs the secret and then the npub header", async () =>
     expect(res.status).toEqual(503);
   });
 });
+
+Deno.test("POST /users answers 400 invalid request for non-object bodies and a non-string username", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, rows } = userDb();
+    const bodies: unknown[] = ['"abc"', "7", "null", "[]", "true", { ...nwcBody(), username: 7 }, { ...nwcBody(), username: {} }];
+    for (const body of bodies) {
+      const { res, pool } = await callUsers(db, "POST", "/", secretHeaders(), body);
+      expect({ body, status: res.status }).toEqual({ body, status: 400 });
+      expect(await res.json()).toEqual({ status: "ERROR", reason: "invalid request" });
+      expect(pool.subscribed).toEqual([]);
+    }
+    expect(rows).toEqual([]);
+  });
+});

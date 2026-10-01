@@ -193,6 +193,39 @@ Deno.test("production load uses a string-literal Deno WASM specifier", () => {
   expect(src.includes("import(BREEZ_SDK_SPARK_DENO_SPECIFIER)")).toEqual(false);
 });
 
+Deno.test("resolveSparkWebhookUrl keeps a configured URL verbatim, trailing slash included", () => {
+  expect(resolveSparkWebhookUrl("https://travelsats.ar", "https://lite.fly.dev/spark/webhook/"))
+    .toEqual("https://lite.fly.dev/spark/webhook/");
+  expect(resolveSparkWebhookUrl("https://travelsats.ar", "  https://lite.fly.dev/spark/webhook  "))
+    .toEqual("https://lite.fly.dev/spark/webhook");
+});
+
+Deno.test("a configured URL with a trailing slash matches a listed webhook with that exact string", async () => {
+  const configured = resolveSparkWebhookUrl("https://travelsats.ar", "https://lite.fly.dev/spark/webhook/");
+  const registered: unknown[] = [];
+  const instance = createBreezSparkMinter({
+    apiKey: "k",
+    mnemonic: "m",
+    webhookUrl: configured,
+    webhookSecret: WEBHOOK_SECRET,
+    loadBreez: (async () => ({
+      defaultConfig: () => ({}),
+      connect: async () => ({
+        listWebhooks: async () => [{ id: "w1", url: "https://lite.fly.dev/spark/webhook/", eventTypes: [] }],
+        unregisterWebhook: async () => {},
+        registerWebhook: async (request: unknown) => {
+          registered.push(request);
+          return { webhookId: "new" };
+        },
+        getInfo: async () => ({ balanceSats: 0 }),
+        receivePayment: async () => ({ paymentRequest: SPEC_INVOICE }),
+      }),
+    })) as never,
+  });
+  await captureLogs(() => instance.connect!());
+  expect(registered).toEqual([]);
+});
+
 Deno.test("resolveSparkWebhookUrl prefers an explicit Fly origin over BASE_URL", async () => {
   const { resolveSparkWebhookUrl } = await import("./breezMinter.ts");
   expect(resolveSparkWebhookUrl("https://travelsats.ar", "https://lite.fly.dev/spark/webhook"))

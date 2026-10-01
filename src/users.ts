@@ -75,16 +75,16 @@ export function createUsersApp(db: DB, nwcPool: NWCPool, now: () => Date = () =>
     const denied = requireRegistrationSecret(c);
     if (denied) return denied;
 
-    let createUserRequest: {
+    const parsed = await readJsonObject(c);
+    if (!parsed.ok) return parsed.response;
+    const createUserRequest = parsed.body as {
       connectionSecret?: string;
       sparkIdentityPubkey?: string;
       username?: string;
       nostrPubkey?: string;
     };
-    try {
-      createUserRequest = await c.req.json();
-    } catch {
-      return c.json(errorEnvelope("invalid json"), 400);
+    if (createUserRequest.username !== undefined && typeof createUserRequest.username !== "string") {
+      return c.json(errorEnvelope("invalid request"), 400);
     }
 
     try {
