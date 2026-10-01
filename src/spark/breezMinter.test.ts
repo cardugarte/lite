@@ -14,9 +14,11 @@ const WEBHOOK_SECRET = "spark-webhook-secret";
 
 Deno.test("main.ts subscribes the minter webhook to the shipped handler", () => {
   const src = Deno.readTextFileSync(new URL("../main.ts", import.meta.url));
+  const app = Deno.readTextFileSync(new URL("../app.ts", import.meta.url));
   expect(src.includes("resolveSparkWebhookUrl(BASE_URL")).toEqual(true);
   expect(src.includes("webhookSecret: SPARK_WEBHOOK_SECRET")).toEqual(true);
-  expect(src.includes('hono.route("/spark/webhook"')).toEqual(true);
+  expect(src.includes("buildApp(")).toEqual(true);
+  expect(app.includes('hono.route("/spark/webhook"')).toEqual(true);
 });
 
 Deno.test("the minter webhook URL resolves from the importable BASE_URL", async () => {
