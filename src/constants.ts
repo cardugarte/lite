@@ -17,7 +17,30 @@ if (!baseUrl) {
 // Annotated so the guaranteed-present value is visible to importers (the guard
 // above runs at module load and exits before anything else can read it).
 export const BASE_URL: string = baseUrl;
-export const DOMAIN = BASE_URL.split("//")[1];
+
+/**
+ * The host Lite signs and publishes: `new URL(BASE_URL).host`, lowercased.
+ * `URL.host` drops a default port the way the Breez server derives it. The
+ * request `Host` header is never read, because behind the production rewrite
+ * it is Lite's own host.
+ */
+export function lnurlDomainFromBaseUrl(base: string): string {
+  return new URL(base).host.toLowerCase();
+}
+
+/** Origins allowed to call `/lnurlpay/*` from a browser. Defaults to the `BASE_URL` origin. */
+export function parseAppOrigins(raw: string | undefined, base: string): string[] {
+  const listed = (raw ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin !== "");
+  return listed.length > 0 ? listed : [new URL(base).origin];
+}
+
+export const LNURL_DOMAIN = lnurlDomainFromBaseUrl(BASE_URL);
+/** Alias kept for existing imports. */
+export const DOMAIN = LNURL_DOMAIN;
+export const APP_ORIGINS = parseAppOrigins(Deno.env.get("APP_ORIGINS"), BASE_URL);
 const databaseUrl = Deno.env.get("DATABASE_URL");
 if (!databaseUrl) {
   console.log("no DATABASE_URL provided, exiting");
