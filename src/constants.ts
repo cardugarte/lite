@@ -54,4 +54,5 @@ export const NOSTR_NIP57_PUBLIC_KEY = NOSTR_NIP57_PRIVATE_KEY ? getPublicKey(hex
 export const BREEZ_API_KEY = Deno.env.get("BREEZ_API_KEY") || "";
 export const SPARK_MINTER_MNEMONIC = Deno.env.get("SPARK_MINTER_MNEMONIC") || "";
 export const SPARK_WEBHOOK_SECRET = Deno.env.get("SPARK_WEBHOOK_SECRET") || "";
-export const SPARK_MINTER_STORAGE_DIR = Deno.env.get("SPARK_MINTER_STORAGE_DIR") || "./.spark-minter";
+/** Optional explicit connection string for the minter's Postgres storage. Default: derived from DATABASE_URL. */
+export const SPARK_MINTER_DATABASE_URL = readEnvValue(Deno.env.get("SPARK_MINTER_DATABASE_URL"));

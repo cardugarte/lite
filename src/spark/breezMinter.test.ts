@@ -1,17 +1,42 @@
 import "../test_setup.ts";
 import { expect } from "jsr:@std/expect";
 import { captureLogs, entriesFor } from "../test_logs.ts";
+import { BREEZ_SDK_SPARK_NODE_SPECIFIER } from "./minter.ts";
 import {
   createBreezSparkMinter,
   resolveSparkWebhookUrl,
   sparkReceiveWebhookUrl,
+  warmUpSparkMinter,
 } from "./breezMinter.ts";
+
+/**
+ * The fakes below were written for `connect(...)`. The minter now builds
+ * through `SdkBuilder` with a Postgres storage backend, so this adapts a
+ * `{defaultConfig, connect}` fake to the module shape the minter loads.
+ */
+// deno-lint-ignore no-explicit-any
+function legacyModule(fake: { defaultConfig: (network: string) => any; connect: (opts: any) => Promise<any> }) {
+  return {
+    defaultConfig: fake.defaultConfig,
+    postgresStorage: (storage: unknown) => ({ storage }),
+    SdkBuilder: {
+      // deno-lint-ignore no-explicit-any
+      new: (config: any, seed: any) => ({
+        // deno-lint-ignore no-explicit-any
+        withStorageBackend: (storage: any) => ({
+          build: () => fake.connect({ config, seed, storage: storage.storage }),
+        }),
+      }),
+    },
+  };
+}
 
 const SPEC_INVOICE =
   "lnbc1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdpl2pkx2ctnv5sxxmmwwd5kgetjypeh2ursdae8g6twvus8g6rfwvs8qun0dfjkxaq9qrsgq357wnc5r2ueh7ck6q93dj32dlqnls087fxdwk8qakdyafkq3yap9us6v52vjjsrvywa6rt52cm9r9zqt8r2t7mlcwspyetp5h2tztugp9lfyql";
 
 const WEBHOOK_URL = "http://lnaddr.test/spark/webhook";
 const WEBHOOK_SECRET = "spark-webhook-secret";
+const DATABASE_URL = "postgres://lite:db-password@db.internal:5432/lite?sslmode=require";
 
 Deno.test("main.ts subscribes the minter webhook to the shipped handler", () => {
   const src = Deno.readTextFileSync(new URL("../main.ts", import.meta.url));
@@ -67,7 +92,8 @@ Deno.test("connects then registers SPARK_LIGHTNING_RECEIVE webhook before mintin
     mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     webhookUrl: WEBHOOK_URL,
     webhookSecret: WEBHOOK_SECRET,
-    loadBreez: async () => ({
+    databaseUrl: DATABASE_URL,
+    loadBreez: async () => legacyModule({
       defaultConfig: (network: string) => ({ apiKey: undefined, network }),
       connect: async () => {
         order.push("connect");
@@ -119,7 +145,8 @@ Deno.test("does not mint if webhook registration fails", async () => {
     mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     webhookUrl: WEBHOOK_URL,
     webhookSecret: WEBHOOK_SECRET,
-    loadBreez: async () => ({
+    databaseUrl: DATABASE_URL,
+    loadBreez: async () => legacyModule({
       defaultConfig: () => ({ apiKey: undefined }),
       connect: async () => ({
         listWebhooks: async () => [],
@@ -153,7 +180,8 @@ Deno.test("retries connect after a failed first sdk() instead of caching the rej
     mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     webhookUrl: WEBHOOK_URL,
     webhookSecret: WEBHOOK_SECRET,
-    loadBreez: async () => ({
+    databaseUrl: DATABASE_URL,
+    loadBreez: async () => legacyModule({
       defaultConfig: () => ({ apiKey: undefined }),
       connect: async () => {
         connects += 1;
@@ -186,11 +214,13 @@ Deno.test("retries connect after a failed first sdk() instead of caching the rej
   expect(minted.invoice).toEqual(SPEC_INVOICE);
 });
 
-Deno.test("production load uses a string-literal Deno WASM specifier", () => {
+Deno.test("production load uses a string-literal specifier of the exported Node entry", () => {
   const src = Deno.readTextFileSync(new URL("./breezMinter.ts", import.meta.url));
-  expect(src.includes('import("npm:@breeztech/breez-sdk-spark@0.25.0/deno/breez_sdk_spark_wasm.js")'))
-    .toEqual(true);
-  expect(src.includes("import(BREEZ_SDK_SPARK_DENO_SPECIFIER)")).toEqual(false);
+  expect(src.includes('import("npm:@breeztech/breez-sdk-spark@0.25.0/nodejs")')).toEqual(true);
+  expect(src.includes("import(BREEZ_SDK_SPARK_NODE_SPECIFIER)")).toEqual(false);
+  // The Deno build has no default storage and crashes the process at connect.
+  expect(src.includes("/deno")).toEqual(false);
+  expect(src.includes("storageDir")).toEqual(false);
 });
 
 Deno.test("resolveSparkWebhookUrl keeps a configured URL verbatim, trailing slash included", () => {
@@ -208,7 +238,8 @@ Deno.test("a configured URL with a trailing slash matches a listed webhook with 
     mnemonic: "m",
     webhookUrl: configured,
     webhookSecret: WEBHOOK_SECRET,
-    loadBreez: (async () => ({
+    databaseUrl: DATABASE_URL,
+    loadBreez: (async () => legacyModule({
       defaultConfig: () => ({}),
       connect: async () => ({
         listWebhooks: async () => [{ id: "w1", url: "https://lite.fly.dev/spark/webhook/", eventTypes: [] }],
@@ -267,7 +298,7 @@ function sdkWorld(options: {
     configs: [],
     paymentLookups: [],
   };
-  const loadBreez = async () => ({
+  const loadBreez = async () => legacyModule({
     defaultConfig: () => ({ apiKey: undefined, lnurlDomain: "breez.tips", ...options.defaultConfig }),
     connect: async (opts: { config: Record<string, unknown> }) => {
       spies.connects += 1;
@@ -305,6 +336,7 @@ function sdkWorld(options: {
       mnemonic: MNEMONIC,
       webhookUrl: WEBHOOK_URL,
       webhookSecret: WEBHOOK_SECRET,
+      databaseUrl: DATABASE_URL,
       loadBreez: loadBreez as never,
     });
   return { spies, minter };
@@ -436,7 +468,8 @@ Deno.test("a failing balance read never blocks connect or minting", async () => 
     mnemonic: MNEMONIC,
     webhookUrl: WEBHOOK_URL,
     webhookSecret: WEBHOOK_SECRET,
-    loadBreez: (async () => ({
+    databaseUrl: DATABASE_URL,
+    loadBreez: (async () => legacyModule({
       defaultConfig: () => ({}),
       connect: async () => ({
         listWebhooks: async () => [],
@@ -457,4 +490,123 @@ Deno.test("minting echoes the receiver key and never looks a payment up in the S
   const { result } = await captureLogs(() => mint(minter()));
   expect(result.receiverPubkey).toEqual(RECEIVER);
   expect(spies.paymentLookups).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// The minter builds through SdkBuilder with Postgres storage, and its startup
+// can never crash the process.
+// ---------------------------------------------------------------------------
+
+Deno.test("the minter builds through SdkBuilder with a Postgres storage backend in the breez_minter schema", async () => {
+  const seen: { storage?: Record<string, unknown>; seed?: Record<string, unknown>; config?: Record<string, unknown> } = {};
+  const instance = createBreezSparkMinter({
+    apiKey: "test-api-key",
+    mnemonic: MNEMONIC,
+    webhookUrl: WEBHOOK_URL,
+    webhookSecret: WEBHOOK_SECRET,
+    databaseUrl: DATABASE_URL,
+    loadBreez: (async () => ({
+      defaultConfig: () => ({ lnurlDomain: "breez.tips" }),
+      postgresStorage: (storage: Record<string, unknown>) => ({ storage }),
+      SdkBuilder: {
+        new: (config: Record<string, unknown>, seed: Record<string, unknown>) => {
+          seen.config = { ...config };
+          seen.seed = seed;
+          return {
+            withStorageBackend: (backend: { storage: Record<string, unknown> }) => {
+              seen.storage = backend.storage;
+              return {
+                build: async () => ({
+                  listWebhooks: async () => [],
+                  unregisterWebhook: async () => {},
+                  registerWebhook: async () => ({ webhookId: "w" }),
+                  getInfo: async () => ({ balanceSats: 0 }),
+                  receivePayment: async () => ({ paymentRequest: SPEC_INVOICE }),
+                }),
+              };
+            },
+          };
+        },
+      },
+    })) as never,
+  });
+  await captureLogs(() => instance.connect!());
+  const url = new URL(String(seen.storage?.connectionString));
+  expect(url.searchParams.get("options")).toEqual("-c search_path=breez_minter");
+  expect(url.searchParams.get("sslmode")).toEqual("require");
+  expect({ ...seen.storage, connectionString: undefined }).toEqual({
+    connectionString: undefined,
+    maxPoolSize: 2,
+    createTimeoutSecs: 10,
+    recycleTimeoutSecs: 60,
+  });
+  expect(seen.config?.apiKey).toEqual("test-api-key");
+  expect(seen.config?.lnurlDomain).toBeUndefined();
+  expect(seen.seed).toEqual({ type: "mnemonic", mnemonic: MNEMONIC, passphrase: undefined });
+});
+
+Deno.test("the exported Node entry resolves and exposes SdkBuilder and postgresStorage", async () => {
+  // The /deno entry has no default storage and a deep wasm path is not exported;
+  // only the ./nodejs entry works under `deno run` and in the compiled binary.
+  const mod = await import(BREEZ_SDK_SPARK_NODE_SPECIFIER);
+  const breez = mod.default ?? mod;
+  expect(typeof breez.SdkBuilder?.new).toEqual("function");
+  expect(typeof breez.postgresStorage).toEqual("function");
+  expect(typeof breez.defaultConfig).toEqual("function");
+});
+
+Deno.test("a failing minter warmup is logged without secrets and never rejects or goes unhandled", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (event: PromiseRejectionEvent) => {
+    event.preventDefault();
+    unhandled.push(event.reason);
+  };
+  globalThis.addEventListener("unhandledrejection", onUnhandled);
+  try {
+    const failing = createBreezSparkMinter({
+      apiKey: "api-key-secret-1",
+      mnemonic: "mnemonic words secret-2",
+      webhookUrl: WEBHOOK_URL,
+      webhookSecret: WEBHOOK_SECRET,
+      databaseUrl: DATABASE_URL,
+      loadBreez: async () => {
+        throw new Error(
+          `load failed for ${DATABASE_URL} key api-key-secret-1 seed mnemonic words secret-2 hook ${WEBHOOK_SECRET}`,
+        );
+      },
+    });
+    const { result, entries, raw } = await captureLogs(async () => {
+      await warmUpSparkMinter(failing, ["api-key-secret-1", "mnemonic words secret-2", WEBHOOK_SECRET]);
+      return "resolved";
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(result).toEqual("resolved");
+    expect(unhandled).toEqual([]);
+    const logged = entries.filter((entry) => entry.message === "spark minter warmup failed");
+    expect(logged.length).toEqual(1);
+    expect(logged[0].level).toEqual("ERROR");
+    expect(logged[0].args?.errorName).toEqual("Error");
+    for (const secret of ["api-key-secret-1", "mnemonic words secret-2", WEBHOOK_SECRET, "db-password"]) {
+      expect(raw.includes(secret)).toEqual(false);
+    }
+    expect(String(logged[0].args?.errorMessage)).toContain("load failed");
+  } finally {
+    globalThis.removeEventListener("unhandledrejection", onUnhandled);
+  }
+});
+
+Deno.test("a succeeding warmup logs nothing as a failure", async () => {
+  const { entries } = await captureLogs(async () => {
+    const world = sdkWorld();
+    await warmUpSparkMinter(world.minter(), []);
+  });
+  expect(entries.filter((entry) => entry.message === "spark minter warmup failed")).toEqual([]);
+});
+
+Deno.test("main.ts warms the minter through the never-rejecting helper and no storage directory remains", () => {
+  const main = Deno.readTextFileSync(new URL("../main.ts", import.meta.url));
+  expect(main.includes("warmUpSparkMinter(")).toEqual(true);
+  expect(main.includes("STORAGE_DIR")).toEqual(false);
+  const constants = Deno.readTextFileSync(new URL("../constants.ts", import.meta.url));
+  expect(constants.includes("STORAGE_DIR")).toEqual(false);
 });

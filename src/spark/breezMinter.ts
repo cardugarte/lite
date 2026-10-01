@@ -1,5 +1,6 @@
 import { logger } from "../logger.ts";
 import { paymentHashFromBolt11 } from "./bolt11.ts";
+import { deriveMinterDatabaseUrl } from "./minterDatabase.ts";
 import { type SparkMinter, type SparkWebhook } from "./minter.ts";
 
 type BreezSdk = {
@@ -25,14 +26,29 @@ type BreezSdk = {
 
 type BreezConfig = { apiKey?: string; lnurlDomain?: string };
 
+type BreezSeed = { type: "mnemonic"; mnemonic: string; passphrase?: string };
+
+type PostgresStorageConfig = {
+  connectionString: string;
+  maxPoolSize: number;
+  createTimeoutSecs: number;
+  recycleTimeoutSecs: number;
+};
+
+/** The part of the SDK's `./nodejs` entry the minter uses. */
 type BreezModule = {
   defaultConfig: (network: string) => BreezConfig;
-  connect: (opts: {
-    config: BreezConfig;
-    seed: { type: "mnemonic"; mnemonic: string; passphrase?: string };
-    storageDir: string;
-  }) => Promise<BreezSdk>;
+  postgresStorage: (config: PostgresStorageConfig) => unknown;
+  SdkBuilder: {
+    new: (config: BreezConfig, seed: BreezSeed) => {
+      withStorageBackend: (storage: unknown) => { build: () => Promise<BreezSdk> };
+    };
+  };
 };
+
+// A small pool: the minter makes few concurrent calls and shares the database
+// with the app.
+const STORAGE_POOL = { maxPoolSize: 2, createTimeoutSecs: 10, recycleTimeoutSecs: 60 } as const;
 
 export function sparkReceiveWebhookUrl(baseUrl: string): string {
   return `${baseUrl.replace(/\/$/, "")}/spark/webhook`;
@@ -51,7 +67,10 @@ export function createBreezSparkMinter(opts: {
   mnemonic: string;
   webhookUrl: string;
   webhookSecret: string;
-  storageDir?: string;
+  /** The app's DATABASE_URL; the minter derives its own connection string from it. */
+  databaseUrl: string;
+  /** Optional explicit minter connection string (SPARK_MINTER_DATABASE_URL). */
+  databaseUrlOverride?: string;
   loadBreez?: () => Promise<BreezModule>;
 }): SparkMinter {
   // Connecting and syncing the webhook are separate steps. A failed webhook
@@ -60,19 +79,25 @@ export function createBreezSparkMinter(opts: {
   let ready: Promise<BreezSdk> | null = null;
 
   async function connectClient(): Promise<BreezSdk> {
+    // The Deno build of the SDK has no default storage and crashes the
+    // process at connect; the Node entry (CJS, so `default` may carry the
+    // exports) works under `deno run` and in the compiled binary.
     const breez = opts.loadBreez
       ? await opts.loadBreez()
-      : await import("npm:@breeztech/breez-sdk-spark@0.25.0/deno/breez_sdk_spark_wasm.js") as BreezModule;
+      : await loadNodeEntry();
     const config = breez.defaultConfig("mainnet");
     config.apiKey = opts.apiKey;
     // The minter only mints. Without an LNURL domain the SDK performs no
     // `recover` against its default breez.tips at connect.
     config.lnurlDomain = undefined;
-    const client = await breez.connect({
-      config,
-      seed: { type: "mnemonic", mnemonic: opts.mnemonic, passphrase: undefined },
-      storageDir: opts.storageDir ?? "./.spark-minter",
+    const storage = breez.postgresStorage({
+      connectionString: deriveMinterDatabaseUrl(opts.databaseUrl, opts.databaseUrlOverride),
+      ...STORAGE_POOL,
     });
+    const client = await breez.SdkBuilder
+      .new(config, { type: "mnemonic", mnemonic: opts.mnemonic, passphrase: undefined })
+      .withStorageBackend(storage)
+      .build();
     await logBalance(client);
     return client;
   }
@@ -166,4 +191,36 @@ export function createBreezSparkMinter(opts: {
       };
     },
   };
+}
+
+async function loadNodeEntry(): Promise<BreezModule> {
+  const mod = await import("npm:@breeztech/breez-sdk-spark@0.25.0/nodejs") as unknown as
+    & { default?: BreezModule }
+    & BreezModule;
+  return mod.default ?? mod;
+}
+
+/** Removes every secret and any connection-string credentials from an error message. */
+export function sanitizeErrorMessage(message: string, secrets: string[]): string {
+  let clean = message.replace(/([a-z][a-z0-9+.-]*:\/\/)[^@\s/]*@/gi, "$1[redacted]@");
+  for (const secret of secrets) {
+    if (secret) clean = clean.split(secret).join("[redacted]");
+  }
+  return clean;
+}
+
+/**
+ * Connects the minter in the background. It never rejects: a failed warmup is
+ * logged (error name and a message without secrets) and the process keeps
+ * serving, minting retries the connect on first use.
+ */
+export async function warmUpSparkMinter(minter: SparkMinter, secrets: string[]): Promise<void> {
+  try {
+    await minter.connect?.();
+  } catch (error) {
+    logger.error("spark minter warmup failed", {
+      errorName: error instanceof Error ? error.name : "Error",
+      errorMessage: sanitizeErrorMessage(error instanceof Error ? error.message : String(error), secrets),
+    });
+  }
 }

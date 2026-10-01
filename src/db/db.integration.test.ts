@@ -2274,3 +2274,27 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "migration 0005 creates the breez_minter schema, is journaled, and is safe to rerun",
+  ignore: !databaseUrl,
+  async fn() {
+    const journal = JSON.parse(
+      await Deno.readTextFile(new URL("../../drizzle/meta/_journal.json", import.meta.url)),
+    ) as { entries: Array<{ idx: number; tag: string }> };
+    const last = journal.entries[journal.entries.length - 1];
+    expect(last).toEqual({ ...last, idx: 5, tag: "0005_breez_minter_schema" });
+    await withDatabase(async (sql) => {
+      await applyNamed(sql, [...THROUGH_0003, MIGRATION_0004]);
+      const before = await sql`select 1 from pg_namespace where nspname = 'breez_minter'`;
+      expect(before.length).toBe(0);
+      await applyNamed(sql, ["0005_breez_minter_schema.sql"]);
+      await applyNamed(sql, ["0005_breez_minter_schema.sql"]);
+      const after = await sql`select 1 from pg_namespace where nspname = 'breez_minter'`;
+      expect(after.length).toBe(1);
+      // The schema starts empty and the public tables are untouched.
+      const tables = await sql`select 1 from information_schema.tables where table_schema = 'breez_minter'`;
+      expect(tables.length).toBe(0);
+    });
+  },
+});

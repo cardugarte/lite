@@ -36,6 +36,13 @@
       "when": 1790873018718,
       "tag": "0004_breez_native_address",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790895997691,
+      "tag": "0005_breez_minter_schema",
+      "breakpoints": true
     }
   ]
 }

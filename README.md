@@ -145,7 +145,7 @@ Names only; set secrets in the environment, never in the repository. Copy
 | `SPARK_WEBHOOK_SECRET` | with minter | HMAC secret registered with the minter webhook. |
 | `SPARK_MINTER_MNEMONIC` | with minter | Seed of the **minter** wallet only. Distinct per environment. Not a user seed. |
 | `BREEZ_API_KEY` | with minter | Server-side Breez API key for the minter. Never ship it in a client bundle. |
-| `SPARK_MINTER_STORAGE_DIR` | no | SDK storage directory. Default `./.spark-minter`. |
+| `SPARK_MINTER_DATABASE_URL` | no | Connection string for the minter's own storage. Default: `DATABASE_URL` with the search path pinned to the `breez_minter` schema. See [Minter storage](#minter-storage). |
 | `NOSTR_NIP57_PRIVATE_KEY` | no | Zapper key, see [NIP-57](https://github.com/nostr-protocol/nips/blob/master/57.md). |
 | `LOG_LEVEL` | no | Log detail. |
 | `PORT` | no | Listen port. Default 8080. |
@@ -209,6 +209,28 @@ The minter also logs `spark_webhook_registered`, `spark_webhook_already_register
 `spark_webhook_stale`, and `spark_minter_balance` at connect. The balance must
 stay constant across restarts: if it rises while the device's balance does not,
 funds are being credited to the minter, so stop and investigate.
+
+## Minter storage
+
+The minter keeps its Breez SDK state (wallet sync data, payments) in Postgres,
+in the `breez_minter` schema of the same database. The SDK creates its own
+tables there on first connect; migration `0005` only creates the empty schema.
+Nothing lives on the container filesystem, so a redeploy never loses it.
+
+Lite derives the minter's connection string from `DATABASE_URL`: other
+parameters (such as `sslmode`) are kept, and `options=-c search_path=breez_minter`
+is added (merged into an existing `options` value). Set
+`SPARK_MINTER_DATABASE_URL` only to point the minter somewhere else; it is then
+used exactly as given.
+
+The minter connects in the background at startup. A failed connect is logged
+as `spark minter warmup failed` (error name and a message with no secrets) and
+the server keeps serving; minting retries the connect on first use.
+
+**Do not expose `breez_minter` through PostgREST.** On Supabase only the schemas
+listed in the API settings are exposed, and that list must not include
+`breez_minter` (or `public` tables of Lite). The schema holds a wallet's sync
+state and must stay server-side.
 
 ## Operations
 
