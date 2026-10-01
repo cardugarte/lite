@@ -2041,3 +2041,51 @@ Deno.test({
     });
   },
 });
+
+Deno.test({
+  name: "findUserByUsername and findActiveBindingIntent read the row and the unexpired intent",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const id = await seedSpark(sql, "alice", NPUB, SPARK_KEY);
+      expect(await db.findUserByUsername("alice")).toEqual({
+        id,
+        username: "alice",
+        nostrPubkey: NPUB,
+        destination: "spark",
+        sparkIdentityPubkey: SPARK_KEY,
+        encryptedConnectionSecret: null,
+      });
+      expect(await db.findUserByUsername("nobody")).toBeNull();
+
+      await seedIntent(sql, {
+        username: "carol",
+        nostrPubkey: NPUB_OTHER,
+        sparkPubkey: SPARK_KEY_OTHER,
+        expiresAt: secondsFrom(NOW, 60),
+      });
+      await seedIntent(sql, {
+        username: "dave",
+        nostrPubkey: NPUB_OTHER,
+        sparkPubkey: SPARK_KEY_OTHER,
+        expiresAt: secondsFrom(NOW, -1),
+      });
+      await seedIntent(sql, {
+        username: "erin",
+        nostrPubkey: NPUB_OTHER,
+        sparkPubkey: SPARK_KEY_OTHER,
+        expiresAt: NOW,
+      });
+      expect(await db.findActiveBindingIntent("carol", NOW)).toEqual({
+        nostrPubkey: NPUB_OTHER,
+        sparkPubkey: SPARK_KEY_OTHER,
+      });
+      expect(await db.findActiveBindingIntent("dave", NOW)).toBeNull();
+      // Active means expires_at strictly after the clock, the same rule as everywhere else.
+      expect(await db.findActiveBindingIntent("erin", NOW)).toBeNull();
+      expect(await db.findActiveBindingIntent("nobody", NOW)).toBeNull();
+      // Reads never change anything.
+      expect((await allIntents(sql)).length).toBe(3);
+    });
+  },
+});

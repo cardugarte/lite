@@ -110,6 +110,23 @@ export class DB {
     return await selectUserBy(this._db, eq(users.sparkIdentityPubkey, pubkey));
   }
 
+  async findUserByUsername(username: string): Promise<UserRow | null> {
+    return await selectUserBy(this._db, eq(users.username, username));
+  }
+
+  /** The intent for `username` whose `expires_at` is strictly after `now`, if any. */
+  async findActiveBindingIntent(
+    username: string,
+    now: Date,
+  ): Promise<{ nostrPubkey: string; sparkPubkey: string } | null> {
+    const [intent] = await this._db
+      .select({ nostrPubkey: bindingIntents.nostrPubkey, sparkPubkey: bindingIntents.sparkPubkey })
+      .from(bindingIntents)
+      .where(and(eq(bindingIntents.username, username), gt(bindingIntents.expiresAt, now)))
+      .limit(1);
+    return intent ?? null;
+  }
+
   /**
    * One transaction: prune expired intents, evaluate conflict rows 1 to 3 in
    * order, upsert the intent (row 4 is the upsert refusing a foreign active
