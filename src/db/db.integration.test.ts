@@ -2204,3 +2204,73 @@ Deno.test({
     });
   },
 });
+
+// ---------------------------------------------------------------------------
+// Review fixes: npub unique violation on register, and one writer per npub.
+// ---------------------------------------------------------------------------
+
+Deno.test({
+  name: "registerSparkAddress maps a nostr-pubkey unique violation to account_username_differs, never an error",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedActiveIntent(sql);
+      // Deterministic stand-in for a concurrent createUser that committed the
+      // same npub after register read the rows: the insert hits the npub index.
+      await sql.unsafe(`
+        create function fail_npub_unique() returns trigger language plpgsql as $$
+        begin
+          raise exception 'duplicate npub' using errcode = '23505', constraint = 'users_nostr_pubkey_unique';
+        end $$
+      `);
+      await sql.unsafe(
+        "create trigger fail_npub_unique before insert on users for each row execute function fail_npub_unique()",
+      );
+      const result = await db.registerSparkAddress(registerInput());
+      expect(result).toEqual({ kind: "conflict", reason: "account_username_differs" });
+      expect(await claimRows(sql)).toEqual([]);
+      expect((await allIntents(sql)).length).toBe(1);
+    });
+  },
+});
+
+Deno.test({
+  name: "a register racing a createUser for the same npub ends in one row and a conflict or success, never an error",
+  ignore: !databaseUrl,
+  async fn() {
+    for (let round = 0; round < 8; round++) {
+      await withRepo(async ({ sql, db }) => {
+        await seedActiveIntent(sql);
+        const settled = await Promise.allSettled([
+          db.registerSparkAddress(registerInput()),
+          db.createUser(createInput({ username: "bob" })),
+        ]);
+        for (const outcome of settled) expect(outcome.status).toBe("fulfilled");
+        const rows = await sql<{ username: string }[]>`select username from users where nostr_pubkey = ${NPUB}`;
+        expect(rows.length).toBe(1);
+        const [registered, created] = settled.map((o) => (o as PromiseFulfilledResult<{ kind: string }>).value);
+        // Exactly one writer wins the account row.
+        const winners = [registered.kind === "created", created.kind === "created"].filter(Boolean).length;
+        expect(winners).toBe(1);
+      });
+    }
+  },
+});
+
+Deno.test({
+  name: "two concurrent intents from one npub for different usernames leave exactly one intent",
+  ignore: !databaseUrl,
+  async fn() {
+    for (let round = 0; round < 8; round++) {
+      await withRepo(async ({ sql, db }) => {
+        const results = await Promise.all([
+          db.createBindingIntent({ npubHex: NPUB, username: "alice", sparkPubkey: SPARK_KEY, now: NOW }),
+          db.createBindingIntent({ npubHex: NPUB, username: "alice-two", sparkPubkey: SPARK_KEY, now: NOW }),
+        ]);
+        expect(results.map((r) => r.kind)).toEqual(["ok", "ok"]);
+        const rows = await allIntents(sql);
+        expect({ round, count: rows.filter((row) => row.nostr_pubkey === NPUB).length }).toEqual({ round, count: 1 });
+      });
+    }
+  },
+});

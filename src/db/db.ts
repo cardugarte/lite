@@ -3,7 +3,7 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { nwc } from "npm:@getalby/sdk";
 import postgres from "npm:postgres@3.4.5";
 
-import { and, eq, gt, isNull, lt, lte, ne } from "drizzle-orm";
+import { and, eq, gt, isNull, lt, lte, ne, sql } from "drizzle-orm";
 import { DATABASE_URL } from "../constants.ts";
 import { decrypt } from "./aesgcm.ts";
 import * as schema from "./schema.ts";
@@ -37,6 +37,16 @@ export interface UserRow {
 type UserRecord = typeof users.$inferSelect;
 type Database = PostgresJsDatabase<typeof schema>;
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
+
+/**
+ * Serializes every account-mutating transaction for one npub. Row locks cannot
+ * do it: they lock nothing while the row does not exist yet, and a
+ * transaction cannot see another one's uncommitted intent. Always the first
+ * statement of the transaction, before any row lock, so the order is fixed.
+ */
+async function lockNpub(tx: Transaction, npubHex: string): Promise<void> {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${"lite:npub:" + npubHex}))`);
+}
 
 function toUserRow(record: UserRecord): UserRow {
   return {
@@ -140,6 +150,7 @@ export class DB {
   }): Promise<BindingIntentResult> {
     const { npubHex, username, sparkPubkey, now } = input;
     return await this._db.transaction(async (tx) => {
+      await lockNpub(tx, npubHex);
       await tx.delete(bindingIntents).where(lte(bindingIntents.expiresAt, now));
 
       const conflict = await firstAccountConflict(tx, { npubHex, username, sparkPubkey });
@@ -182,15 +193,19 @@ export class DB {
     const { username, sparkPubkey, statement, now } = input;
     try {
       return await this._db.transaction(async (tx): Promise<RegisterResult> => {
-        const [intent] = await tx
-          .select()
-          .from(bindingIntents)
-          .where(and(eq(bindingIntents.username, username), gt(bindingIntents.expiresAt, now)))
-          .for("update");
-        if (!intent || intent.sparkPubkey !== sparkPubkey) {
+        const activeIntent = and(eq(bindingIntents.username, username), gt(bindingIntents.expiresAt, now));
+        // The npub lock comes first (see lockNpub), so the owner is read
+        // without a lock, then the intent is locked and re-checked under it.
+        const [peek] = await tx.select().from(bindingIntents).where(activeIntent);
+        if (!peek || peek.sparkPubkey !== sparkPubkey) {
           throw new Rollback<RegisterResult>({ kind: "no_intent" });
         }
-        const npub = intent.nostrPubkey;
+        const npub = peek.nostrPubkey;
+        await lockNpub(tx, npub);
+        const [intent] = await tx.select().from(bindingIntents).where(activeIntent).for("update");
+        if (!intent || intent.sparkPubkey !== sparkPubkey || intent.nostrPubkey !== npub) {
+          throw new Rollback<RegisterResult>({ kind: "no_intent" });
+        }
 
         const claimed = await tx
           .insert(signedStatements)
@@ -267,6 +282,8 @@ export class DB {
       const reason = uniqueViolationConflict(error);
       if (reason === "username_taken") return { kind: "conflict", reason: CONFLICT.NAME_TAKEN };
       if (reason === "pubkey_taken") return { kind: "conflict", reason: CONFLICT.PUBKEY_TAKEN };
+      // The account row appeared after the rows were read: the account holds another username.
+      if (reason === "account_exists") return { kind: "conflict", reason: CONFLICT.ACCOUNT_USERNAME_DIFFERS };
       throw error;
     }
   }
@@ -287,6 +304,7 @@ export class DB {
     const username = input.username.toLowerCase();
     try {
       return await this._db.transaction(async (tx): Promise<CreateUserResult> => {
+        await lockNpub(tx, npubHex);
         if (await selectUserBy(tx, eq(users.username, username))) {
           return { kind: "conflict", reason: "username_taken" };
         }
@@ -331,6 +349,7 @@ export class DB {
   > {
     const npub = npubHex.toLowerCase();
     return await this._db.transaction(async (tx) => {
+      await lockNpub(tx, npub);
       const [current] = await tx
         .select()
         .from(users)
@@ -360,6 +379,7 @@ export class DB {
     // Legacy rows may hold an empty npub; an empty assertion must never match them.
     if (npub === "") return 0;
     return await this._db.transaction(async (tx) => {
+      await lockNpub(tx, npub);
       await tx.delete(bindingIntents).where(eq(bindingIntents.nostrPubkey, npub));
       const removed = await tx
         .delete(users)
