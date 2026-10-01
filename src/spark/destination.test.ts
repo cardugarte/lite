@@ -38,12 +38,14 @@ Deno.test("NWC pool skips spark rows and null connection secrets", () => {
   ).toBe(true);
 });
 
-Deno.test("POST /users routes spark when only sparkIdentityPubkey is set", () => {
+Deno.test("POST /users rejects sparkIdentityPubkey", () => {
   expect(
     routeCreateUser({ sparkIdentityPubkey: "02ab", nostrPubkey: "aa" }),
   ).toEqual({
-    kind: "spark",
-    sparkIdentityPubkey: "02ab",
+    kind: "error",
+    reason:
+      "sparkIdentityPubkey is not accepted; register Spark addresses through the signed LNURL register",
+    status: 400,
   });
 });
 
@@ -64,15 +66,15 @@ Deno.test("POST /users rejects neither destination", () => {
   });
 });
 
-Deno.test("POST /users rejects both destinations", () => {
-  const routed = routeCreateUser({
+Deno.test("POST /users rejects a body that sets both keys", () => {
+  expect(routeCreateUser({
     connectionSecret: "nostr+walletconnect://x",
     sparkIdentityPubkey: "02ab",
     nostrPubkey: "aa",
+  })).toEqual({
+    kind: "error",
+    reason:
+      "sparkIdentityPubkey is not accepted; register Spark addresses through the signed LNURL register",
+    status: 400,
   });
-  expect(routed.kind).toEqual("error");
-  if (routed.kind === "error") {
-    expect(routed.status).toEqual(400);
-    expect(routed.reason).toMatch(/both/i);
-  }
 });

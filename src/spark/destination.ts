@@ -23,31 +23,23 @@ export type CreateUserBody = {
   nostrPubkey?: string;
 };
 
+const SPARK_CREATE_REJECTED =
+  "sparkIdentityPubkey is not accepted; register Spark addresses through the signed LNURL register";
+
 export type CreateUserRoute =
   | { kind: "nwc"; connectionSecret: string }
-  | { kind: "spark"; sparkIdentityPubkey: string }
   | { kind: "error"; reason: string; status: 400 };
 
 export function routeCreateUser(body: CreateUserBody): CreateUserRoute {
-  const hasSecret = Boolean(body.connectionSecret);
-  const hasSpark = Boolean(body.sparkIdentityPubkey);
-
-  if (hasSecret && hasSpark) {
+  if ("sparkIdentityPubkey" in body) {
+    return { kind: "error", reason: SPARK_CREATE_REJECTED, status: 400 };
+  }
+  if (!body.connectionSecret) {
     return {
       kind: "error",
-      reason: "Provide either connectionSecret or sparkIdentityPubkey, not both",
+      reason: "no connection secret provided",
       status: 400,
     };
   }
-  if (hasSpark) {
-    return { kind: "spark", sparkIdentityPubkey: body.sparkIdentityPubkey as string };
-  }
-  if (hasSecret) {
-    return { kind: "nwc", connectionSecret: body.connectionSecret as string };
-  }
-  return {
-    kind: "error",
-    reason: "no connection secret provided",
-    status: 400,
-  };
+  return { kind: "nwc", connectionSecret: body.connectionSecret };
 }
