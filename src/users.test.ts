@@ -1,6 +1,6 @@
 import "./test_setup.ts";
 import { expect } from "jsr:@std/expect";
-import postgres from "postgres";
+import { decrypt } from "./db/aesgcm.ts";
 import type { DB } from "./db/db.ts";
 import { logger } from "./logger.ts";
 import type { NWCPool } from "./nwc/nwcPool.ts";
@@ -18,13 +18,6 @@ const ALLOWED_BROWSER_HEADERS = {
   "Content-Type": "application/json",
   Origin: "https://travelsats.ar",
 };
-
-function postgresUniqueError() {
-  const error = new postgres.PostgresError("duplicate key");
-  (error as postgres.PostgresError & { constraint_name: string }).constraint_name =
-    "users_username_unique";
-  return error;
-}
 
 function mockPool() {
   const subscribed: Array<{ secret: string; userId: number }> = [];
@@ -52,21 +45,36 @@ function userDb(mode: "ok" | "unique" | "boom" | "race" = "ok") {
   const rows: StoredUser[] = [];
   let chain: Promise<void> = Promise.resolve();
   const db = {
-    createUser: (connectionSecret: string, username?: string, nostrPubkey?: string) => {
+    createUser: (input: {
+      npubHex: string;
+      username: string;
+      encryptedSecret: string;
+      now: Date;
+    }) => {
       const run = chain.then(async () => {
         if (mode === "boom") throw new Error("connection refused");
-        if (mode === "unique") throw postgresUniqueError();
-        const name = username || "generated";
-        if (rows.some((row) => row.username === name)) throw postgresUniqueError();
+        if (mode === "unique" || rows.some((row) => row.username === input.username)) {
+          return { kind: "conflict" as const, reason: "username_taken" as const };
+        }
         const row = {
           id: rows.length + 1,
-          username: name,
-          nostrPubkey: nostrPubkey || "",
-          connectionSecret,
+          username: input.username,
+          nostrPubkey: input.npubHex,
+          connectionSecret: await decrypt(input.encryptedSecret),
         };
         rows.push(row);
         if (mode === "race") await new Promise((resolve) => setTimeout(resolve, 15));
-        return { id: row.id, username: row.username, nostrPubkey: row.nostrPubkey };
+        return {
+          kind: "created" as const,
+          user: {
+            id: row.id,
+            username: row.username,
+            nostrPubkey: row.nostrPubkey,
+            destination: "nwc" as const,
+            sparkIdentityPubkey: null,
+            encryptedConnectionSecret: input.encryptedSecret,
+          },
+        };
       });
       chain = run.then(() => {}, () => {});
       return run;

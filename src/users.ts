@@ -1,8 +1,8 @@
 import { nip19 } from "@nostr/tools";
 import { Hono } from "hono";
-import postgres from "postgres";
 import { errorEnvelope, requireRegistrationSecret } from "./auth/bff.ts";
 import { DOMAIN } from "./constants.ts";
+import { encrypt } from "./db/aesgcm.ts";
 import { DB } from "./db/db.ts";
 import { parseNwcConnectionSecret } from "./db/userValues.ts";
 import { logger } from "./logger.ts";
@@ -16,13 +16,6 @@ function normalizeNostrPubkey(nostrPubkey: string | undefined): string | null {
     return nip19.decode(nostrPubkey).data as string;
   }
   return nostrPubkey;
-}
-
-function usernameTakenReason(error: unknown): string | null {
-  if (error instanceof postgres.PostgresError && error.constraint_name === "users_username_unique") {
-    return "Username has already been taken";
-  }
-  return null;
 }
 
 export function createUsersApp(db: DB, nwcPool: NWCPool) {
@@ -76,20 +69,28 @@ export function createUsersApp(db: DB, nwcPool: NWCPool) {
         }
       }
 
-      const user = await db.createUser(
-        routed.connectionSecret,
-        createUserRequest.username,
-        nostrPubkey,
-      );
+      const username = (createUserRequest.username ||
+        Math.floor(Math.random() * 100000000000).toString()).toLowerCase();
+      const created = await db.createUser({
+        npubHex: nostrPubkey,
+        username,
+        encryptedSecret: await encrypt(routed.connectionSecret),
+        now: new Date(),
+      });
+      if (created.kind === "conflict") {
+        // L7.1 maps every conflict reason to its exact status and text.
+        const reason = created.reason === "username_taken"
+          ? "Username has already been taken"
+          : "conflict";
+        return c.json(errorEnvelope(reason), 409);
+      }
 
-      nwcPool.subscribeUser(routed.connectionSecret, user.id);
+      nwcPool.subscribeUser(routed.connectionSecret, created.user.id);
 
       return c.json({
-        lightningAddress: user.username + "@" + DOMAIN,
+        lightningAddress: created.user.username + "@" + DOMAIN,
       });
     } catch (error) {
-      const taken = usernameTakenReason(error);
-      if (taken) return c.json(errorEnvelope(taken), 409);
       logger.error("create user failed", {
         errorName: error instanceof Error ? error.name : "Error",
       });

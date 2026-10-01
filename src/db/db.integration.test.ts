@@ -1,5 +1,6 @@
 import { expect } from "jsr:@std/expect";
 import postgres from "npm:postgres@3.4.5";
+import type { DB } from "./db.ts";
 
 const databaseUrl = Deno.env.get("LITE_TEST_DATABASE_URL")?.trim() || "";
 
@@ -655,13 +656,20 @@ Deno.test({
   sanitizeResources: false,
   async fn() {
     await withDatabase(async (sql, url) => {
-      await applyNamed(sql, THROUGH_0003);
+      await applyNamed(sql, [...THROUGH_0003, MIGRATION_0004]);
       Deno.env.set("DATABASE_URL", url);
       Deno.env.set("BASE_URL", "http://lnaddr.test");
       Deno.env.set("ENCRYPTION_KEY", ZERO_KEY);
-      const { DB } = await import("./db.ts");
-      const db = new DB();
-      const created = await db.createUser(NWC_URL, "Alice", "AB".repeat(32));
+      const { DB: Repository } = await import("./db.ts");
+      const db = new Repository(url);
+      const result = await db.createUser({
+        npubHex: "AB".repeat(32),
+        username: "Alice",
+        encryptedSecret: "enc-alice",
+        now: NOW,
+      });
+      if (result.kind !== "created") throw new Error("expected created");
+      const created = result.user;
       const rows = await sql<{
         username: string;
         nostr_pubkey: string;
@@ -675,7 +683,6 @@ Deno.test({
       expect(rows[0].nostr_pubkey).toBe("ab".repeat(32));
       expect(rows[0].destination).toBe("nwc");
 
-      await applyNamed(sql, [MIGRATION_0004]);
       const sparkId = await insertUser(sql, {
         username: "spark-recv",
         nostrPubkey: NPUB_OTHER,
@@ -770,6 +777,7 @@ Deno.test({
         select preimage from invoices where payment_hash = 'hash-repo-nwc'
       `;
       expect(nwcSettled[0].preimage).toBe("22".repeat(32));
+      await db.close();
     });
   },
 });
@@ -855,6 +863,713 @@ Deno.test({
       ]);
       expect(rebindCount.count).toBe("0");
       expect(after).toEqual(before);
+    });
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Account repository (L4): binding intents, NWC create and bind, abandon.
+// Every test runs on a fresh database migrated through 0004 and opens the
+// repository against that database with an injected clock.
+// ---------------------------------------------------------------------------
+
+const NOW = new Date("2026-03-01T12:00:00.000Z");
+const INTENT_TTL_MS = 600 * 1000;
+const SPARK_KEY_THIRD = "02" + "ef".repeat(32);
+
+function secondsFrom(base: Date, seconds: number): Date {
+  return new Date(base.getTime() + seconds * 1000);
+}
+
+type RepoContext = { sql: Sql; db: DB; url: string };
+
+async function withRepo(fn: (ctx: RepoContext) => Promise<void>): Promise<void> {
+  await withDatabase(async (sql, url) => {
+    await applyNamed(sql, [...THROUGH_0003, MIGRATION_0004]);
+    Deno.env.set("DATABASE_URL", url);
+    Deno.env.set("BASE_URL", "http://lnaddr.test");
+    Deno.env.set("ENCRYPTION_KEY", ZERO_KEY);
+    const { DB: Repository } = await import("./db.ts");
+    const db = new Repository(url);
+    try {
+      await fn({ sql, db, url });
+    } finally {
+      await db.close();
+    }
+  });
+}
+
+async function seedNwc(sql: Sql, username: string, nostrPubkey: string): Promise<number> {
+  return await insertUser(sql, {
+    username,
+    nostrPubkey,
+    connectionSecret: `enc-${username}`,
+    destination: "nwc",
+    sparkIdentityPubkey: null,
+  });
+}
+
+async function seedSpark(
+  sql: Sql,
+  username: string,
+  nostrPubkey: string,
+  sparkIdentityPubkey: string,
+): Promise<number> {
+  return await insertUser(sql, {
+    username,
+    nostrPubkey,
+    connectionSecret: null,
+    destination: "spark",
+    sparkIdentityPubkey,
+  });
+}
+
+async function seedIntent(
+  sql: Sql,
+  intent: { username: string; nostrPubkey: string; sparkPubkey: string; expiresAt: Date },
+): Promise<void> {
+  await sql`
+    insert into binding_intents (username, nostr_pubkey, spark_pubkey, expires_at)
+    values (${intent.username}, ${intent.nostrPubkey}, ${intent.sparkPubkey}, ${intent.expiresAt})
+  `;
+}
+
+type IntentRow = {
+  username: string;
+  nostr_pubkey: string;
+  spark_pubkey: string;
+  expires_at: Date;
+};
+
+async function allIntents(sql: Sql): Promise<IntentRow[]> {
+  return await sql<IntentRow[]>`
+    select username, nostr_pubkey, spark_pubkey, expires_at
+    from binding_intents
+    order by username
+  `;
+}
+
+async function userSnapshot(sql: Sql) {
+  return await sql`select * from users order by id`;
+}
+
+Deno.test({
+  name: "findUserByNostrPubkey and findUserBySparkPubkey return the account row or null",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const nwcId = await seedNwc(sql, "alice", NPUB);
+      const sparkId = await seedSpark(sql, "bob", NPUB_OTHER, SPARK_KEY);
+
+      expect(await db.findUserByNostrPubkey(NPUB)).toEqual({
+        id: nwcId,
+        username: "alice",
+        nostrPubkey: NPUB,
+        destination: "nwc",
+        sparkIdentityPubkey: null,
+        encryptedConnectionSecret: "enc-alice",
+      });
+      expect(await db.findUserBySparkPubkey(SPARK_KEY)).toEqual({
+        id: sparkId,
+        username: "bob",
+        nostrPubkey: NPUB_OTHER,
+        destination: "spark",
+        sparkIdentityPubkey: SPARK_KEY,
+        encryptedConnectionSecret: null,
+      });
+      expect(await db.findUserByNostrPubkey(NPUB_THIRD)).toBeNull();
+      expect(await db.findUserBySparkPubkey(SPARK_KEY_OTHER)).toBeNull();
+    });
+  },
+});
+
+Deno.test({
+  name: "createBindingIntent on a free name stores the intent for 600 seconds and leaves users untouched",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "bob", NPUB_OTHER);
+      const before = await userSnapshot(sql);
+
+      const result = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY,
+        now: NOW,
+      });
+
+      const expected = new Date(NOW.getTime() + INTENT_TTL_MS);
+      expect(result).toEqual({ kind: "ok", expiresAt: expected });
+      expect(await allIntents(sql)).toEqual([
+        { username: "alice", nostr_pubkey: NPUB, spark_pubkey: SPARK_KEY, expires_at: expected },
+      ]);
+      expect(await userSnapshot(sql)).toEqual(before);
+    });
+  },
+});
+
+Deno.test({
+  name: "createBindingIntent lets the account switch its own NWC row without changing it",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "alice", NPUB);
+      const before = await userSnapshot(sql);
+
+      const result = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY,
+        now: NOW,
+      });
+
+      expect(result.kind).toBe("ok");
+      expect((await allIntents(sql)).map((row) => row.username)).toEqual(["alice"]);
+      expect(await userSnapshot(sql)).toEqual(before);
+    });
+  },
+});
+
+Deno.test({
+  name: "createBindingIntent applies each conflict row and leaves no intent behind",
+  ignore: !databaseUrl,
+  async fn() {
+    // Row 1: the username belongs to another account.
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "alice", NPUB_OTHER);
+      const result = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY,
+        now: NOW,
+      });
+      expect(result).toEqual({ kind: "conflict", reason: "name_taken" });
+      expect(await allIntents(sql)).toEqual([]);
+    });
+    // Row 2: the account already holds a different username.
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "bob", NPUB);
+      const result = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY,
+        now: NOW,
+      });
+      expect(result).toEqual({ kind: "conflict", reason: "account_username_differs" });
+      expect(await allIntents(sql)).toEqual([]);
+    });
+    // Row 3: the Spark key is bound to another account.
+    await withRepo(async ({ sql, db }) => {
+      await seedSpark(sql, "carol", NPUB_OTHER, SPARK_KEY);
+      const result = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY,
+        now: NOW,
+      });
+      expect(result).toEqual({ kind: "conflict", reason: "pubkey_taken" });
+      expect(await allIntents(sql)).toEqual([]);
+    });
+  },
+});
+
+Deno.test({
+  name: "createBindingIntent answers name_in_progress for a foreign active intent and leaves it unchanged",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const foreignExpiry = secondsFrom(NOW, 120);
+      await seedIntent(sql, {
+        username: "alice",
+        nostrPubkey: NPUB_OTHER,
+        sparkPubkey: SPARK_KEY_OTHER,
+        expiresAt: foreignExpiry,
+      });
+
+      const result = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY,
+        now: NOW,
+      });
+
+      expect(result).toEqual({ kind: "conflict", reason: "name_in_progress" });
+      expect(await allIntents(sql)).toEqual([
+        {
+          username: "alice",
+          nostr_pubkey: NPUB_OTHER,
+          spark_pubkey: SPARK_KEY_OTHER,
+          expires_at: foreignExpiry,
+        },
+      ]);
+    });
+  },
+});
+
+Deno.test({
+  name: "createBindingIntent ignores and prunes expired intents",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedIntent(sql, {
+        username: "alice",
+        nostrPubkey: NPUB_OTHER,
+        sparkPubkey: SPARK_KEY_OTHER,
+        expiresAt: secondsFrom(NOW, -1),
+      });
+      await seedIntent(sql, {
+        username: "stale-one",
+        nostrPubkey: NPUB_THIRD,
+        sparkPubkey: SPARK_KEY_THIRD,
+        expiresAt: secondsFrom(NOW, -3600),
+      });
+      await seedIntent(sql, {
+        username: "live",
+        nostrPubkey: NPUB_THIRD,
+        sparkPubkey: SPARK_KEY_THIRD,
+        expiresAt: secondsFrom(NOW, 90),
+      });
+
+      const result = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY,
+        now: NOW,
+      });
+
+      expect(result.kind).toBe("ok");
+      // The expired foreign intent for alice was replaced, the second expired
+      // intent was pruned, and the unrelated active intent survives.
+      expect((await allIntents(sql)).map((row) => [row.username, row.nostr_pubkey])).toEqual([
+        ["alice", NPUB],
+        ["live", NPUB_THIRD],
+      ]);
+    });
+  },
+});
+
+Deno.test({
+  name: "createBindingIntent keeps one precedence: name_taken, differs, pubkey_taken, in_progress",
+  ignore: !databaseUrl,
+  async fn() {
+    // name_taken beats account_username_differs.
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "bob", NPUB);
+      await seedNwc(sql, "alice", NPUB_OTHER);
+      expect(
+        await db.createBindingIntent({
+          npubHex: NPUB,
+          username: "alice",
+          sparkPubkey: SPARK_KEY,
+          now: NOW,
+        }),
+      ).toEqual({ kind: "conflict", reason: "name_taken" });
+    });
+    // account_username_differs (row 2) beats pubkey_taken (row 3) and
+    // name_in_progress (row 4).
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "alice", NPUB);
+      await seedSpark(sql, "mallory", NPUB_OTHER, SPARK_KEY);
+      await seedIntent(sql, {
+        username: "carol",
+        nostrPubkey: NPUB_THIRD,
+        sparkPubkey: SPARK_KEY_THIRD,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+      expect(
+        await db.createBindingIntent({
+          npubHex: NPUB,
+          username: "carol",
+          sparkPubkey: SPARK_KEY,
+          now: NOW,
+        }),
+      ).toEqual({ kind: "conflict", reason: "account_username_differs" });
+    });
+    // With no row for the account, pubkey_taken (row 3) beats name_in_progress (row 4).
+    await withRepo(async ({ sql, db }) => {
+      await seedSpark(sql, "mallory", NPUB_OTHER, SPARK_KEY);
+      await seedIntent(sql, {
+        username: "carol",
+        nostrPubkey: NPUB_THIRD,
+        sparkPubkey: SPARK_KEY_THIRD,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+      expect(
+        await db.createBindingIntent({
+          npubHex: NPUB,
+          username: "carol",
+          sparkPubkey: SPARK_KEY,
+          now: NOW,
+        }),
+      ).toEqual({ kind: "conflict", reason: "pubkey_taken" });
+    });
+  },
+});
+
+Deno.test({
+  name: "createBindingIntent keeps one active intent per account and per username",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const first = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY,
+        now: NOW,
+      });
+      expect(first.kind).toBe("ok");
+
+      // Same npub, same username: key replaced, expiry renewed.
+      const later = secondsFrom(NOW, 100);
+      const renewed = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice",
+        sparkPubkey: SPARK_KEY_OTHER,
+        now: later,
+      });
+      const renewedExpiry = new Date(later.getTime() + INTENT_TTL_MS);
+      expect(renewed).toEqual({ kind: "ok", expiresAt: renewedExpiry });
+      expect(await allIntents(sql)).toEqual([
+        {
+          username: "alice",
+          nostr_pubkey: NPUB,
+          spark_pubkey: SPARK_KEY_OTHER,
+          expires_at: renewedExpiry,
+        },
+      ]);
+
+      // Same npub, another username: the previous intent is dropped.
+      const second = await db.createBindingIntent({
+        npubHex: NPUB,
+        username: "alice-two",
+        sparkPubkey: SPARK_KEY_OTHER,
+        now: later,
+      });
+      expect(second.kind).toBe("ok");
+      expect((await allIntents(sql)).map((row) => row.username)).toEqual(["alice-two"]);
+
+      // Another npub cannot displace an active intent.
+      const foreign = await db.createBindingIntent({
+        npubHex: NPUB_OTHER,
+        username: "alice-two",
+        sparkPubkey: SPARK_KEY,
+        now: later,
+      });
+      expect(foreign).toEqual({ kind: "conflict", reason: "name_in_progress" });
+      expect((await allIntents(sql)).map((row) => row.nostr_pubkey)).toEqual([NPUB]);
+    });
+  },
+});
+
+Deno.test({
+  name: "createBindingIntent concurrent requests from two accounts leave exactly one intent",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const [a, b] = await Promise.all([
+        db.createBindingIntent({
+          npubHex: NPUB,
+          username: "alice",
+          sparkPubkey: SPARK_KEY,
+          now: NOW,
+        }),
+        db.createBindingIntent({
+          npubHex: NPUB_OTHER,
+          username: "alice",
+          sparkPubkey: SPARK_KEY_OTHER,
+          now: NOW,
+        }),
+      ]);
+      const kinds = [a.kind, b.kind].sort();
+      expect(kinds).toEqual(["conflict", "ok"]);
+      const rows = await allIntents(sql);
+      expect(rows.length).toBe(1);
+      const winner = a.kind === "ok" ? NPUB : NPUB_OTHER;
+      expect(rows[0].nostr_pubkey).toBe(winner);
+    });
+  },
+});
+
+function createInput(
+  overrides: Partial<{ npubHex: string; username: string; encryptedSecret: string; now: Date }> = {},
+) {
+  return {
+    npubHex: NPUB,
+    username: "alice",
+    encryptedSecret: "enc-new",
+    now: NOW,
+    ...overrides,
+  };
+}
+
+Deno.test({
+  name: "createUser stores a lowercase NWC row and reports the new account",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const result = await db.createUser(
+        createInput({ npubHex: "AB".repeat(32), username: "Alice", encryptedSecret: "enc-alice" }),
+      );
+      if (result.kind !== "created") throw new Error(`expected created, got ${result.kind}`);
+      expect(result.user).toEqual({
+        id: result.user.id,
+        username: "alice",
+        nostrPubkey: "ab".repeat(32),
+        destination: "nwc",
+        sparkIdentityPubkey: null,
+        encryptedConnectionSecret: "enc-alice",
+      });
+      const [stored] = await sql<{ username: string; nostr_pubkey: string; destination: string }[]>`
+        select username, nostr_pubkey, destination from users where id = ${result.user.id}
+      `;
+      expect(stored).toEqual({
+        username: "alice",
+        nostr_pubkey: "ab".repeat(32),
+        destination: "nwc",
+      });
+    });
+  },
+});
+
+Deno.test({
+  name: "createUser conflicts follow username_taken, account_exists, name_in_progress",
+  ignore: !databaseUrl,
+  async fn() {
+    // All three apply: the username is taken, the npub has a row, and a foreign intent exists.
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "alice", NPUB_OTHER);
+      await seedNwc(sql, "bob", NPUB);
+      await seedIntent(sql, {
+        username: "alice",
+        nostrPubkey: NPUB_THIRD,
+        sparkPubkey: SPARK_KEY,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+      expect(await db.createUser(createInput({ username: "alice" }))).toEqual({
+        kind: "conflict",
+        reason: "username_taken",
+      });
+      const rows = await sql`select 1 from users`;
+      expect(rows.length).toBe(2);
+    });
+    // The npub has a row and a foreign intent exists for the new name.
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "bob", NPUB);
+      await seedIntent(sql, {
+        username: "carol",
+        nostrPubkey: NPUB_THIRD,
+        sparkPubkey: SPARK_KEY,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+      expect(await db.createUser(createInput({ username: "carol" }))).toEqual({
+        kind: "conflict",
+        reason: "account_exists",
+      });
+    });
+    // Only the foreign intent applies.
+    await withRepo(async ({ sql, db }) => {
+      await seedIntent(sql, {
+        username: "carol",
+        nostrPubkey: NPUB_THIRD,
+        sparkPubkey: SPARK_KEY,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+      expect(await db.createUser(createInput({ username: "carol" }))).toEqual({
+        kind: "conflict",
+        reason: "name_in_progress",
+      });
+      expect((await sql`select 1 from users`).length).toBe(0);
+      expect((await allIntents(sql)).length).toBe(1);
+    });
+  },
+});
+
+Deno.test({
+  name: "createUser is not blocked by the account's own intent or by an expired foreign one",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedIntent(sql, {
+        username: "alice",
+        nostrPubkey: NPUB,
+        sparkPubkey: SPARK_KEY,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+      const own = await db.createUser(createInput({ username: "alice" }));
+      expect(own.kind).toBe("created");
+    });
+    await withRepo(async ({ sql, db }) => {
+      await seedIntent(sql, {
+        username: "alice",
+        nostrPubkey: NPUB_OTHER,
+        sparkPubkey: SPARK_KEY,
+        expiresAt: secondsFrom(NOW, -1),
+      });
+      const expired = await db.createUser(createInput({ username: "alice" }));
+      expect(expired.kind).toBe("created");
+    });
+  },
+});
+
+Deno.test({
+  name: "createUser maps concurrent unique violations to conflicts instead of errors",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const sameName = await Promise.all([
+        db.createUser(createInput({ npubHex: NPUB, username: "alice" })),
+        db.createUser(createInput({ npubHex: NPUB_OTHER, username: "alice" })),
+      ]);
+      expect(sameName.map((result) => result.kind).sort()).toEqual(["conflict", "created"]);
+      const nameLoser = sameName.find((result) => result.kind === "conflict");
+      expect(nameLoser).toEqual({ kind: "conflict", reason: "username_taken" });
+
+      const sameAccount = await Promise.all([
+        db.createUser(createInput({ npubHex: NPUB_THIRD, username: "carol" })),
+        db.createUser(createInput({ npubHex: NPUB_THIRD, username: "dave" })),
+      ]);
+      expect(sameAccount.map((result) => result.kind).sort()).toEqual(["conflict", "created"]);
+      const accountLoser = sameAccount.find((result) => result.kind === "conflict");
+      expect(accountLoser).toEqual({ kind: "conflict", reason: "account_exists" });
+      expect((await sql`select 1 from users`).length).toBe(2);
+    });
+  },
+});
+
+Deno.test({
+  name: "bindNwcDestination moves a Spark row to NWC in place with an encrypted secret",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const id = await seedSpark(sql, "alice", NPUB, SPARK_KEY);
+      const [before] = await sql<{ created_at: Date }[]>`select created_at from users where id = ${id}`;
+      const { encrypt, decrypt } = await import("./aesgcm.ts");
+      const ciphertext = await encrypt(NWC_URL);
+
+      const result = await db.bindNwcDestination(NPUB, ciphertext, NOW);
+
+      if (result.kind !== "bound") throw new Error(`expected bound, got ${result.kind}`);
+      expect(result.user.id).toBe(id);
+      expect(result.user.username).toBe("alice");
+      expect(result.user.destination).toBe("nwc");
+      expect(result.user.sparkIdentityPubkey).toBeNull();
+      const [row] = await sql<{
+        connection_secret: string;
+        spark_identity_pubkey: string | null;
+        destination: string;
+        created_at: Date;
+      }[]>`select connection_secret, spark_identity_pubkey, destination, created_at from users where id = ${id}`;
+      expect(row.destination).toBe("nwc");
+      expect(row.spark_identity_pubkey).toBeNull();
+      expect(row.created_at).toEqual(before.created_at);
+      expect(row.connection_secret).not.toBe(NWC_URL);
+      expect(await decrypt(row.connection_secret)).toBe(NWC_URL);
+    });
+  },
+});
+
+Deno.test({
+  name: "bindNwcDestination replaces the secret of an NWC row and reports not_found without a row",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const id = await seedNwc(sql, "alice", NPUB);
+      const replaced = await db.bindNwcDestination(NPUB, "enc-replaced", NOW);
+      if (replaced.kind !== "bound") throw new Error(`expected bound, got ${replaced.kind}`);
+      expect(replaced.user.id).toBe(id);
+      const [row] = await sql<{ connection_secret: string }[]>`
+        select connection_secret from users where id = ${id}
+      `;
+      expect(row.connection_secret).toBe("enc-replaced");
+
+      expect(await db.bindNwcDestination(NPUB_OTHER, "enc-x", NOW)).toEqual({ kind: "not_found" });
+      expect((await sql`select 1 from users`).length).toBe(1);
+    });
+  },
+});
+
+Deno.test({
+  name: "bindNwcDestination refuses a foreign active intent on the row's username and allows its own",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedSpark(sql, "alice", NPUB, SPARK_KEY);
+      await seedIntent(sql, {
+        username: "alice",
+        nostrPubkey: NPUB_OTHER,
+        sparkPubkey: SPARK_KEY_OTHER,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+      expect(await db.bindNwcDestination(NPUB, "enc-x", NOW)).toEqual({
+        kind: "conflict",
+        reason: "name_in_progress",
+      });
+      const [unchanged] = await sql<{ destination: string }[]>`select destination from users`;
+      expect(unchanged.destination).toBe("spark");
+    });
+    await withRepo(async ({ sql, db }) => {
+      await seedSpark(sql, "alice", NPUB, SPARK_KEY);
+      await seedIntent(sql, {
+        username: "alice",
+        nostrPubkey: NPUB,
+        sparkPubkey: SPARK_KEY_OTHER,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+      const own = await db.bindNwcDestination(NPUB, "enc-x", NOW);
+      expect(own.kind).toBe("bound");
+    });
+  },
+});
+
+Deno.test({
+  name: "deleteUserByNostrPubkey removes the account, its invoices and intents, and nothing else",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      const doomed = await seedNwc(sql, "alice", NPUB);
+      const survivor = await seedNwc(sql, "bob", NPUB_OTHER);
+      await sql`
+        insert into invoices (user_id, amount, payment_request, payment_hash, minted_by)
+        values (${doomed}, 1000, 'pr-doomed', 'hash-doomed', 'nwc'),
+               (${survivor}, 1000, 'pr-survivor', 'hash-survivor', 'nwc')
+      `;
+      await seedIntent(sql, {
+        username: "carol",
+        nostrPubkey: NPUB,
+        sparkPubkey: SPARK_KEY,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+      await seedIntent(sql, {
+        username: "dave",
+        nostrPubkey: NPUB_OTHER,
+        sparkPubkey: SPARK_KEY_OTHER,
+        expiresAt: secondsFrom(NOW, 300),
+      });
+
+      expect(await db.deleteUserByNostrPubkey(NPUB)).toBe(1);
+
+      expect((await sql<{ username: string }[]>`select username from users`).map((r) => r.username))
+        .toEqual(["bob"]);
+      expect((await sql<{ payment_hash: string }[]>`select payment_hash from invoices`).map((r) =>
+        r.payment_hash
+      )).toEqual(["hash-survivor"]);
+      expect((await allIntents(sql)).map((row) => row.username)).toEqual(["dave"]);
+
+      expect(await db.deleteUserByNostrPubkey(NPUB)).toBe(0);
+      expect((await sql`select 1 from users`).length).toBe(1);
+    });
+  },
+});
+
+Deno.test({
+  name: "deleteUserByNostrPubkey never matches legacy rows with an empty npub",
+  ignore: !databaseUrl,
+  async fn() {
+    await withRepo(async ({ sql, db }) => {
+      await seedNwc(sql, "legacy-one", "");
+      await seedNwc(sql, "legacy-two", "");
+      expect(await db.deleteUserByNostrPubkey("")).toBe(0);
+      expect((await sql`select 1 from users`).length).toBe(2);
     });
   },
 });
