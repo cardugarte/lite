@@ -1,47 +1,9 @@
 import { expect } from "jsr:@std/expect";
 import { nwc } from "npm:@getalby/sdk";
-import {
-  buildSparkUserValues,
-  parseNwcConnectionSecret,
-} from "./userValues.ts";
+import { normalizeUsername, parseNwcConnectionSecret, usernameProblem } from "./userValues.ts";
 
 const NWC_URL =
   "nostr+walletconnect://0ba9d3de7e3e201aad29ee6b9fca20da0e5fc638c4b0513671eaea9c16a3989f?relay=wss://relay.getalby.com/v1&secret=bdaec8619bcf63a7c797043092ef72a6f62270c0f832561faf8f51f0cfdfce33";
-
-const SPARK_PUBKEY =
-  "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-Deno.test("createSparkUser does not store a spendable NWC secret", () => {
-  const values = buildSparkUserValues({
-    sparkIdentityPubkey: SPARK_PUBKEY,
-    username: "alice",
-    nostrPubkey: "aa".repeat(32),
-  });
-
-  expect(values.encryptedConnectionSecret).toBeNull();
-  expect(values.destination).toEqual("spark");
-  expect(values.sparkIdentityPubkey).toEqual(SPARK_PUBKEY);
-  expect(values.username).toEqual("alice");
-  expect(values.nostrPubkey).toEqual("aa".repeat(32));
-});
-
-Deno.test("createSparkUser rejects a missing spark identity pubkey", () => {
-  expect(() =>
-    buildSparkUserValues({
-      sparkIdentityPubkey: "",
-      username: "alice",
-    })
-  ).toThrow("no spark identity pubkey provided");
-});
-
-Deno.test("createSparkUser rejects a non-compressed spark identity pubkey", () => {
-  expect(() =>
-    buildSparkUserValues({
-      sparkIdentityPubkey: "not-a-key",
-      username: "alice",
-    })
-  ).toThrow(/compressed secp256k1/i);
-});
 
 Deno.test("NWC createUser still parses a wallet connect URI with a secret", () => {
   const parsed = parseNwcConnectionSecret(NWC_URL);
@@ -59,4 +21,25 @@ Deno.test("NWC createUser still throws when the URI has no secret", () => {
       "nostr+walletconnect://0ba9d3de7e3e201aad29ee6b9fca20da0e5fc638c4b0513671eaea9c16a3989f?relay=wss://relay.getalby.com/v1",
     )
   ).toThrow("no secret found in connection secret");
+});
+
+Deno.test("normalizeUsername trims and lowercases", () => {
+  expect(normalizeUsername("  Alice ")).toBe("alice");
+  expect(normalizeUsername("BOB.Smith")).toBe("bob.smith");
+});
+
+Deno.test("usernameProblem accepts the Breez username form", () => {
+  const accepted = ["alice", "a", "a.b", "first.last.name", "user_name", "a+b", "x!#$%&'*+/=?^_`{|}~-y", "12345"];
+  for (const name of accepted) expect(usernameProblem(name)).toBeNull();
+  expect(usernameProblem("a".repeat(64))).toBeNull();
+});
+
+Deno.test("usernameProblem rejects leading, trailing, and consecutive dots and other characters", () => {
+  const rejected = [".alice", "alice.", "a..b", "has space", "tab\tname", "new\nline", "ali@ce", "ali\u00e7e", ""];
+  for (const name of rejected) expect(usernameProblem(name)).toBe("invalid");
+});
+
+Deno.test("usernameProblem reports a name longer than 64 characters as too long", () => {
+  expect(usernameProblem("a".repeat(65))).toBe("too_long");
+  expect(usernameProblem(("a".repeat(30) + ".").repeat(3))).toBe("too_long");
 });

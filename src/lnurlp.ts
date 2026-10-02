@@ -5,12 +5,21 @@ import { nwc } from "npm:@getalby/sdk";
 import { logger } from "./logger.ts";
 import { BASE_URL } from "./constants.ts";
 import { DB } from "./db/db.ts";
-import { verifyInvoiceSettlement } from "./lud21-verify.ts";
+import { createMissingSettlementReporter, verifyInvoiceSettlement } from "./lud21-verify.ts";
 import { isSparkUser } from "./spark/destination.ts";
 import type { SparkMinter } from "./spark/minter.ts";
 
-export function createLnurlApp(db: DB, sparkMinter?: SparkMinter) {
+export function createLnurlApp(
+  db: DB,
+  sparkMinter?: SparkMinter,
+  now: () => Date = () => new Date(),
+) {
   const hono = new Hono();
+  // A lost webhook leaves a paid Spark invoice unsettled; this is how it shows up in the logs.
+  const reportMissingSettlement = createMissingSettlementReporter({
+    now,
+    log: (fields) => logger.warn("spark settlement missing", { event: "spark_settlement_missing", ...fields }),
+  });
 
   hono.get("/:username/callback", async (c) => {
     try {
@@ -63,7 +72,10 @@ export function createLnurlApp(db: DB, sparkMinter?: SparkMinter) {
           invoice: minted.invoice,
           payment_hash: minted.paymentHash,
           metadata,
-        } as unknown as nwc.Nip47Transaction);
+        } as unknown as nwc.Nip47Transaction, {
+          by: "spark",
+          receiverPubkey: minted.receiverPubkey,
+        });
         return c.json({
           verify: `${BASE_URL}/lnurlp/${username}/verify/${minted.paymentHash}`,
           routes: [],
@@ -85,7 +97,7 @@ export function createLnurlApp(db: DB, sparkMinter?: SparkMinter) {
         metadata,
       });
 
-      await db.createInvoice(user.id, transaction);
+      await db.createInvoice(user.id, transaction, { by: "nwc" });
 
       return c.json({
         verify: `${BASE_URL}/lnurlp/${username}/verify/${transaction.payment_hash}`,
@@ -117,27 +129,27 @@ export function createLnurlApp(db: DB, sparkMinter?: SparkMinter) {
       user = null;
     }
 
-    const spark = user ? isSparkUser(user) : false;
-
     const body = await verifyInvoiceSettlement({
       invoice,
       ownerUserId: user?.id ?? null,
+      ownerDestination: user?.destination ?? null,
       lookupInvoice: async () => {
-        if (!user || spark) return null;
-        if (!user.connectionSecret) return null;
+        // Only reached for an NWC invoice whose owner is still on NWC.
+        if (!user?.connectionSecret) return null;
         const nwcClient = new nwc.NWCClient({
           nostrWalletConnectUrl: user.connectionSecret,
         });
         return await nwcClient.lookupInvoice({ payment_hash: paymentHash });
       },
       markSettled: async (lookup) => {
-        if (!user || spark || !lookup.preimage) return;
+        if (!user || !lookup.preimage) return;
         await db.markInvoiceSettled(user.id, {
           payment_hash: paymentHash,
           preimage: lookup.preimage,
           settled_at: lookup.settled_at ?? Math.floor(Date.now() / 1000),
         } as nwc.Nip47Transaction);
       },
+      onMissingSettlement: reportMissingSettlement,
     });
 
     return c.json(body);

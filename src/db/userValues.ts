@@ -1,12 +1,6 @@
 import { nwc } from "npm:@getalby/sdk";
 
-export type SparkUserValues = {
-  encryptedConnectionSecret: null;
-  destination: "spark";
-  sparkIdentityPubkey: string;
-  username: string;
-  nostrPubkey: string;
-};
+export const SPARK_PUBKEY_REGEX = /^0[23][0-9a-f]{64}$/;
 
 export function parseNwcConnectionSecret(connectionSecret: string) {
   const parsed = nwc.NWCClient.parseWalletConnectUrl(connectionSecret);
@@ -16,27 +10,21 @@ export function parseNwcConnectionSecret(connectionSecret: string) {
   return parsed;
 }
 
-const COMPRESSED_SECP256K1_HEX = /^0[23][0-9a-fA-F]{64}$/;
+export const USERNAME_MAX_LENGTH = 64;
 
-export function buildSparkUserValues(input: {
-  sparkIdentityPubkey: string;
-  username?: string;
-  nostrPubkey?: string;
-}): SparkUserValues {
-  if (!input.sparkIdentityPubkey) {
-    throw new Error("no spark identity pubkey provided");
-  }
-  const sparkIdentityPubkey = input.sparkIdentityPubkey.trim();
-  if (!COMPRESSED_SECP256K1_HEX.test(sparkIdentityPubkey)) {
-    throw new Error(
-      "Spark identity pubkey must be a 33-byte compressed secp256k1 key (66 hex chars starting with 02 or 03)",
-    );
-  }
-  return {
-    encryptedConnectionSecret: null,
-    destination: "spark",
-    sparkIdentityPubkey: sparkIdentityPubkey.toLowerCase(),
-    username: input.username || Math.floor(Math.random() * 100000000000).toString(),
-    nostrPubkey: input.nostrPubkey || "",
-  };
+/**
+ * Breez `USERNAME_VALIDATION_REGEX`: an RFC 5322 unquoted local part. Dots are
+ * allowed but not leading, trailing, or consecutive.
+ */
+export const USERNAME_PATTERN =
+  /^[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+)*$/;
+
+/** The form the SDK signs and Lite stores: `trim().toLowerCase()` (Breez `lnurl-models`). */
+export const normalizeUsername = (raw: string): string => raw.trim().toLowerCase();
+
+/** Why a normalized username is unusable, or null when it is valid. Length is checked before the pattern. */
+export function usernameProblem(normalized: string): "too_long" | "invalid" | null {
+  if (normalized.length > USERNAME_MAX_LENGTH) return "too_long";
+  if (!USERNAME_PATTERN.test(normalized)) return "invalid";
+  return null;
 }

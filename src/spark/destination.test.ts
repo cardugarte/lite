@@ -5,45 +5,53 @@ import {
   shouldSubscribeNwc,
 } from "./destination.ts";
 
-Deno.test("NULL destination is nwc, not spark", () => {
-  expect(isSparkUser({ destination: null, sparkIdentityPubkey: null })).toBe(
+Deno.test("destination kind comes from the destination column only", () => {
+  expect(isSparkUser({ destination: "spark", sparkIdentityPubkey: "02ab" })).toBe(
+    true,
+  );
+  expect(shouldSubscribeNwc({
+    destination: "spark",
+    encryptedConnectionSecret: "enc",
+  })).toBe(false);
+
+  expect(isSparkUser({ destination: "nwc", sparkIdentityPubkey: null })).toBe(
     false,
   );
-  expect(
-    isSparkUser({ destination: "spark", sparkIdentityPubkey: "02ab" }),
-  ).toBe(true);
-  expect(
-    isSparkUser({ destination: null, sparkIdentityPubkey: "02ab" }),
-  ).toBe(true);
+  expect(shouldSubscribeNwc({
+    destination: "nwc",
+    encryptedConnectionSecret: "enc",
+  })).toBe(true);
+  expect(shouldSubscribeNwc({
+    destination: "nwc",
+    encryptedConnectionSecret: null,
+  })).toBe(false);
+  expect(shouldSubscribeNwc({
+    destination: "nwc",
+    encryptedConnectionSecret: "",
+  })).toBe(false);
+
+  expect(isSparkUser({
+    destination: "nwc",
+    sparkIdentityPubkey: "02ab",
+  })).toBe(false);
+  expect(isSparkUser({
+    destination: null,
+    sparkIdentityPubkey: "02ab",
+  })).toBe(false);
+  expect(shouldSubscribeNwc({
+    destination: null,
+    encryptedConnectionSecret: "enc",
+  })).toBe(false);
 });
 
-Deno.test("NWC pool skips spark rows and null connection secrets", () => {
-  expect(
-    shouldSubscribeNwc({
-      destination: "spark",
-      encryptedConnectionSecret: null,
-    }),
-  ).toBe(false);
-  expect(
-    shouldSubscribeNwc({
-      destination: null,
-      encryptedConnectionSecret: null,
-    }),
-  ).toBe(false);
-  expect(
-    shouldSubscribeNwc({
-      destination: null,
-      encryptedConnectionSecret: "enc",
-    }),
-  ).toBe(true);
-});
-
-Deno.test("POST /users routes spark when only sparkIdentityPubkey is set", () => {
+Deno.test("POST /users rejects sparkIdentityPubkey", () => {
   expect(
     routeCreateUser({ sparkIdentityPubkey: "02ab", nostrPubkey: "aa" }),
   ).toEqual({
-    kind: "spark",
-    sparkIdentityPubkey: "02ab",
+    kind: "error",
+    reason:
+      "sparkIdentityPubkey is not accepted; register Spark addresses through the signed LNURL register",
+    status: 400,
   });
 });
 
@@ -64,15 +72,15 @@ Deno.test("POST /users rejects neither destination", () => {
   });
 });
 
-Deno.test("POST /users rejects both destinations", () => {
-  const routed = routeCreateUser({
+Deno.test("POST /users rejects a body that sets both keys", () => {
+  expect(routeCreateUser({
     connectionSecret: "nostr+walletconnect://x",
     sparkIdentityPubkey: "02ab",
     nostrPubkey: "aa",
+  })).toEqual({
+    kind: "error",
+    reason:
+      "sparkIdentityPubkey is not accepted; register Spark addresses through the signed LNURL register",
+    status: 400,
   });
-  expect(routed.kind).toEqual("error");
-  if (routed.kind === "error") {
-    expect(routed.status).toEqual(400);
-    expect(routed.reason).toMatch(/both/i);
-  }
 });

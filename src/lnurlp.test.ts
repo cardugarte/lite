@@ -3,6 +3,7 @@ import { expect } from "jsr:@std/expect";
 import { nwc } from "npm:@getalby/sdk";
 import type { DB } from "./db/db.ts";
 import { createLnurlApp } from "./lnurlp.ts";
+import { logger } from "./logger.ts";
 import type { SparkMinter } from "./spark/minter.ts";
 
 const ROW_PUBKEY =
@@ -32,13 +33,17 @@ Deno.test("LNURL callback mints with the row identity pubkey and ignores request
   const minter: SparkMinter = {
     async createInvoice(input) {
       minted.push(input);
-      return { invoice: "lnbc1sparkinvoice", paymentHash: PAYMENT_HASH };
+      return { invoice: "lnbc1sparkinvoice", paymentHash: PAYMENT_HASH, receiverPubkey: ROW_PUBKEY };
     },
   };
   const db = {
     findUser: async () => sparkUser(),
-    createInvoice: async (userId: number, transaction: { invoice: string }) => {
-      invoices.push({ userId, invoice: transaction.invoice });
+    createInvoice: async (
+      userId: number,
+      transaction: { invoice: string },
+      minted?: { by: string; receiverPubkey?: string },
+    ) => {
+      invoices.push({ userId, invoice: transaction.invoice, minted });
     },
   } as unknown as DB;
 
@@ -55,7 +60,11 @@ Deno.test("LNURL callback mints with the row identity pubkey and ignores request
   expect(minted).toEqual([
     { receiverIdentityPubkey: ROW_PUBKEY, amountSats: 2500, memo: "hi" },
   ]);
-  expect(invoices).toEqual([{ userId: 7, invoice: "lnbc1sparkinvoice" }]);
+  expect(invoices).toEqual([{
+    userId: 7,
+    invoice: "lnbc1sparkinvoice",
+    minted: { by: "spark", receiverPubkey: ROW_PUBKEY },
+  }]);
 });
 
 Deno.test("LUD-21 spark verify returns settled from persisted preimage without lookupInvoice", async () => {
@@ -68,6 +77,8 @@ Deno.test("LUD-21 spark verify returns settled from persisted preimage without l
       preimage: PREIMAGE,
       paymentRequest: "lnbc1sparkinvoice",
       paymentHash: PAYMENT_HASH,
+      mintedBy: "spark",
+      createdAt: new Date("2026-03-09T12:00:00Z"),
     }),
     markInvoiceSettled: async () => {
       throw new Error("NWC markInvoiceSettled must not run");
@@ -105,6 +116,8 @@ Deno.test("LUD-21 spark unpaid verify does not construct NWC lookupInvoice", asy
       preimage: null,
       paymentRequest: "lnbc1sparkinvoice",
       paymentHash: PAYMENT_HASH,
+      mintedBy: "spark",
+      createdAt: new Date(),
     }),
     markInvoiceSettled: async () => {
       throw new Error("persist must not run");
@@ -134,7 +147,7 @@ function nwcUser() {
     id: 3,
     nostrPubkey: "aa".repeat(32),
     connectionSecret: NWC_URL,
-    destination: null,
+    destination: "nwc",
     sparkIdentityPubkey: null,
   };
 }
@@ -167,17 +180,24 @@ Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invo
     } as nwc.Nip47Transaction;
   } as typeof nwc.NWCClient.prototype.makeInvoice;
 
-  const invoices: Array<{ userId: number; invoice: string; paymentHash: string }> = [];
+  const invoices: Array<{
+    userId: number;
+    invoice: string;
+    paymentHash: string;
+    minted?: { by: string; receiverPubkey?: string | null };
+  }> = [];
   const db = {
     findUser: async () => nwcUser(),
     createInvoice: async (
       userId: number,
       transaction: { invoice: string; payment_hash: string },
+      minted?: { by: string; receiverPubkey?: string | null },
     ) => {
       invoices.push({
         userId,
         invoice: transaction.invoice,
         paymentHash: transaction.payment_hash,
+        minted,
       });
     },
   } as unknown as DB;
@@ -200,6 +220,7 @@ Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invo
       userId: 3,
       invoice: "lnbc1nwcinvoice",
       paymentHash: PAYMENT_HASH,
+      minted: { by: "nwc" },
     }]);
   } finally {
     nwc.NWCClient.prototype.makeInvoice = original;
@@ -233,6 +254,8 @@ Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the pr
       preimage: null,
       paymentRequest: "lnbc1nwcinvoice",
       paymentHash: PAYMENT_HASH,
+      mintedBy: "nwc",
+      createdAt: new Date(),
     }),
     markInvoiceSettled: async (
       userId: number,
@@ -265,4 +288,200 @@ Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the pr
   } finally {
     nwc.NWCClient.prototype.lookupInvoice = original;
   }
+});
+
+// ---------------------------------------------------------------------------
+// L9.3: verify follows the invoice, not the user's current credential.
+// ---------------------------------------------------------------------------
+
+const UNPAID_SPARK = { status: "OK", settled: false, preimage: null, pr: "lnbc1sparkinvoice" };
+
+function storedInvoice(overrides: Record<string, unknown> = {}) {
+  return {
+    userId: 3,
+    settledAt: null,
+    preimage: null,
+    paymentRequest: "lnbc1sparkinvoice",
+    paymentHash: PAYMENT_HASH,
+    mintedBy: "spark",
+    createdAt: new Date(),
+    ...overrides,
+  };
+}
+
+/** Replaces the NWC client methods with spies that record calls and, for lookup, answer a preimage. */
+function spyOnNwcLookup() {
+  const calls: string[] = [];
+  const original = nwc.NWCClient.prototype.lookupInvoice;
+  nwc.NWCClient.prototype.lookupInvoice = async function () {
+    calls.push("lookupInvoice");
+    return { preimage: PREIMAGE, settled_at: 1_700_000_000, state: "settled" } as unknown as nwc.Nip47Transaction;
+  } as typeof nwc.NWCClient.prototype.lookupInvoice;
+  return {
+    calls,
+    restore: () => {
+      nwc.NWCClient.prototype.lookupInvoice = original;
+    },
+  };
+}
+
+function minterWithSdkSpies() {
+  const calls: string[] = [];
+  const minter = {
+    createInvoice: async () => {
+      throw new Error("mint must not run on verify");
+    },
+    getPayment: () => void calls.push("getPayment"),
+    listPayments: () => void calls.push("listPayments"),
+  } as unknown as SparkMinter;
+  return { minter, calls };
+}
+
+Deno.test("a Spark invoice of a user now on NWC is never looked up on the NWC wallet or the SDK", async () => {
+  const spy = spyOnNwcLookup();
+  const { minter, calls } = minterWithSdkSpies();
+  try {
+    const db = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () => storedInvoice(),
+      markInvoiceSettled: async () => {
+        throw new Error("persist must not run");
+      },
+    } as unknown as DB;
+    const res = await createLnurlApp(db, minter).request(`/bob/verify/${PAYMENT_HASH}`);
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual(UNPAID_SPARK);
+    expect(spy.calls).toEqual([]);
+    expect(calls).toEqual([]);
+  } finally {
+    spy.restore();
+  }
+});
+
+Deno.test("a Spark invoice settled by webhook verifies as settled after the owner switched to NWC", async () => {
+  const spy = spyOnNwcLookup();
+  try {
+    const db = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () =>
+        storedInvoice({ settledAt: new Date("2026-03-09T12:00:06Z"), preimage: PREIMAGE }),
+    } as unknown as DB;
+    const res = await createLnurlApp(db, minterWithSdkSpies().minter).request(`/bob/verify/${PAYMENT_HASH}`);
+    expect(await res.json()).toEqual({ status: "OK", settled: true, preimage: PREIMAGE, pr: "lnbc1sparkinvoice" });
+    expect(spy.calls).toEqual([]);
+  } finally {
+    spy.restore();
+  }
+});
+
+Deno.test("an NWC invoice of a user now on Spark makes no lookup and answers unpaid", async () => {
+  const spy = spyOnNwcLookup();
+  try {
+    const db = {
+      findUser: async () => ({ ...sparkUser(), id: 3 }),
+      findInvoice: async () => storedInvoice({ mintedBy: "nwc", paymentRequest: "lnbc1nwcinvoice" }),
+      markInvoiceSettled: async () => {
+        throw new Error("persist must not run");
+      },
+    } as unknown as DB;
+    const res = await createLnurlApp(db, minterWithSdkSpies().minter).request(`/alice/verify/${PAYMENT_HASH}`);
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({ status: "OK", settled: false, preimage: null, pr: "lnbc1nwcinvoice" });
+    expect(spy.calls).toEqual([]);
+  } finally {
+    spy.restore();
+  }
+});
+
+Deno.test("a thrown NWC lookup answers HTTP 200 unpaid, and another user's invoice is Not found", async () => {
+  const original = nwc.NWCClient.prototype.lookupInvoice;
+  nwc.NWCClient.prototype.lookupInvoice = async function () {
+    throw new Error("relay timeout");
+  } as typeof nwc.NWCClient.prototype.lookupInvoice;
+  try {
+    const db = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () => storedInvoice({ mintedBy: "nwc", paymentRequest: "lnbc1nwcinvoice" }),
+    } as unknown as DB;
+    const res = await createLnurlApp(db).request(`/bob/verify/${PAYMENT_HASH}`);
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({ status: "OK", settled: false, preimage: null, pr: "lnbc1nwcinvoice" });
+
+    const other = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () => storedInvoice({ userId: 99, mintedBy: "nwc" }),
+    } as unknown as DB;
+    const notFound = await createLnurlApp(other).request(`/bob/verify/${PAYMENT_HASH}`);
+    expect(notFound.status).toEqual(200);
+    expect(await notFound.json()).toEqual({ status: "ERROR", reason: "Not found" });
+  } finally {
+    nwc.NWCClient.prototype.lookupInvoice = original;
+  }
+});
+
+Deno.test("verify logs spark_settlement_missing once per hash for an old unsettled Spark invoice", async () => {
+  const now = new Date("2026-03-09T12:10:00Z");
+  const writable = logger as unknown as { levelName: string; handlers: Array<{ levelName: string }> };
+  const previousLevel = writable.levelName;
+  const previousHandlers = writable.handlers.map((handler) => handler.levelName);
+  writable.levelName = "DEBUG";
+  for (const handler of writable.handlers) handler.levelName = "DEBUG";
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map((arg) => typeof arg === "string" ? arg : JSON.stringify(arg)).join(" "));
+  };
+  try {
+    const ageOf = (seconds: number) => new Date(now.getTime() - seconds * 1000);
+    for (const [seconds, calls] of [[360, 3], [240, 1], [300, 1]] as const) {
+      const db = {
+        findUser: async () => ({ ...sparkUser(), id: 3 }),
+        findInvoice: async () => storedInvoice({ createdAt: ageOf(seconds), paymentHash: `${seconds}` }),
+      } as unknown as DB;
+      const app = createLnurlApp(db, minterWithSdkSpies().minter, () => now);
+      for (let i = 0; i < calls; i++) {
+        const res = await app.request(`/alice/verify/${seconds}`);
+        expect(await res.json()).toEqual(UNPAID_SPARK);
+      }
+    }
+  } finally {
+    console.log = original;
+    writable.levelName = previousLevel;
+    writable.handlers.forEach((handler, index) => {
+      handler.levelName = previousHandlers[index];
+    });
+  }
+  const missing = lines
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => entry?.args?.event === "spark_settlement_missing");
+  expect(missing.length).toEqual(1);
+  expect(missing[0].level).toEqual("WARN");
+  expect(missing[0].args.payment_hash).toEqual("360");
+  expect(missing[0].args.age_seconds).toEqual(360);
+  expect(lines.join("\n")).not.toContain(PREIMAGE);
+});
+
+Deno.test("the mint records the receiver key the minter reports, not a value read from elsewhere", async () => {
+  const reported = "02dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+  const minter: SparkMinter = {
+    async createInvoice() {
+      return { invoice: "lnbc1sparkinvoice", paymentHash: PAYMENT_HASH, receiverPubkey: reported };
+    },
+  };
+  const written: Array<{ by: string; receiverPubkey?: string }> = [];
+  const db = {
+    findUser: async () => sparkUser(),
+    createInvoice: async (_userId: number, _tx: unknown, minted: { by: string; receiverPubkey?: string }) => {
+      written.push(minted);
+    },
+  } as unknown as DB;
+  const res = await createLnurlApp(db, minter).request("/alice/callback?amount=1000000");
+  expect(res.status).toEqual(200);
+  expect(written).toEqual([{ by: "spark", receiverPubkey: reported }]);
 });
