@@ -5,9 +5,39 @@ on:
   push:
     branches:
       - master
+  pull_request:
 jobs:
+  test:
+    name: Type-check and tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Disposable database: the integration suite creates and drops its own
+      # databases on this server.
+      LITE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: 2.9.7 # keep in sync with the Dockerfile
+      - run: deno check src/main.ts
+      - run: deno task test
+      - run: deno task test:integration
   deploy:
     name: Deploy app
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     concurrency: deploy-group # optional: ensure only one action runs at a time
     steps:
