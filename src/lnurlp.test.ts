@@ -1,11 +1,17 @@
 import "./test_setup.ts";
 import { expect } from "jsr:@std/expect";
 import { nwc } from "npm:@getalby/sdk";
+import { sha256 } from "npm:@noble/hashes@1.3.1/sha256";
+import { bytesToHex, hexToBytes } from "npm:@noble/hashes@1.3.1/utils";
 import { INVOICE_EXPIRY_SECS } from "./constants.ts";
 import type { DB } from "./db/db.ts";
 import { createLnurlApp } from "./lnurlp.ts";
 import { logger } from "./logger.ts";
 import type { SparkMinter } from "./spark/minter.ts";
+import { captureLogs, entriesFor } from "./test_logs.ts";
+
+/** The payment hash a preimage proves, computed here and not by the code under test. */
+const hashOf = (preimage: string) => bytesToHex(sha256(hexToBytes(preimage)));
 
 const ROW_PUBKEY =
   "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -233,6 +239,7 @@ Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invo
 
 Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the preimage", async () => {
   const preimage = "cc".repeat(32);
+  const paymentHash = hashOf(preimage);
   const lookups: Array<{ secret?: string; paymentHash?: string }> = [];
   const settled: Array<{ userId: number; preimage?: string; paymentHash?: string }> = [];
   const original = nwc.NWCClient.prototype.lookupInvoice;
@@ -257,7 +264,7 @@ Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the pr
       settledAt: null,
       preimage: null,
       paymentRequest: "lnbc1nwcinvoice",
-      paymentHash: PAYMENT_HASH,
+      paymentHash,
       mintedBy: "nwc",
       createdAt: new Date(),
     }),
@@ -275,7 +282,7 @@ Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the pr
 
   try {
     const app = createLnurlApp(db, minterThatMustNotRun());
-    const res = await app.request(`/bob/verify/${PAYMENT_HASH}`);
+    const res = await app.request(`/bob/verify/${paymentHash}`);
     expect(res.status).toEqual(200);
     expect(await res.json()).toEqual({
       status: "OK",
@@ -283,11 +290,11 @@ Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the pr
       preimage,
       pr: "lnbc1nwcinvoice",
     });
-    expect(lookups).toEqual([{ secret: NWC_SECRET, paymentHash: PAYMENT_HASH }]);
+    expect(lookups).toEqual([{ secret: NWC_SECRET, paymentHash }]);
     expect(settled).toEqual([{
       userId: 3,
       preimage,
-      paymentHash: PAYMENT_HASH,
+      paymentHash,
     }]);
   } finally {
     nwc.NWCClient.prototype.lookupInvoice = original;
@@ -530,5 +537,40 @@ Deno.test("a configured invoice expiry reaches the NWC wallet as expiry", async 
     expect(seen).toEqual([120]);
   } finally {
     nwc.NWCClient.prototype.makeInvoice = original;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// An NWC preimage settles an invoice only when its sha256 is the payment hash.
+// ---------------------------------------------------------------------------
+
+Deno.test("an NWC lookup preimage that hashes to another value answers unpaid, caches nothing and logs the mismatch", async () => {
+  const preimage = "cc".repeat(32);
+  const wrong = "dd".repeat(32);
+  const paymentHash = hashOf(preimage);
+  const original = nwc.NWCClient.prototype.lookupInvoice;
+  nwc.NWCClient.prototype.lookupInvoice = async function () {
+    return { preimage: wrong, settled_at: 1_700_000_000, state: "settled" } as unknown as nwc.Nip47Transaction;
+  } as typeof nwc.NWCClient.prototype.lookupInvoice;
+  try {
+    const db = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () => storedInvoice({ mintedBy: "nwc", paymentRequest: "lnbc1nwcinvoice", paymentHash }),
+      markInvoiceSettled: async () => {
+        throw new Error("persist must not run");
+      },
+    } as unknown as DB;
+    const { result: res, entries, raw } = await captureLogs(async () =>
+      await createLnurlApp(db).request(`/bob/verify/${paymentHash}`)
+    );
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({ status: "OK", settled: false, preimage: null, pr: "lnbc1nwcinvoice" });
+    const mismatches = entriesFor(entries, "nwc_preimage_mismatch");
+    expect(mismatches.length).toEqual(1);
+    expect(mismatches[0].level).toEqual("WARN");
+    expect(mismatches[0].args?.payment_hash).toEqual(paymentHash);
+    expect(raw).not.toContain(wrong);
+  } finally {
+    nwc.NWCClient.prototype.lookupInvoice = original;
   }
 });

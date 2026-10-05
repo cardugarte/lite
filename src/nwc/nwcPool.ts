@@ -6,7 +6,13 @@ import { NOSTR_NIP57_PRIVATE_KEY } from "../constants.ts";
 import { decrypt } from "../db/aesgcm.ts";
 import { DB } from "../db/db.ts";
 import { logger } from "../logger.ts";
+import { preimageMatchesPaymentHash } from "../preimage.ts";
 import { shouldSubscribeNwc } from "../spark/destination.ts";
+
+/** The transaction with its preimage replaced, safe to log. */
+function redactTransaction<T extends { preimage?: unknown }>(transaction: T): T {
+  return transaction?.preimage ? { ...transaction, preimage: "[redacted]" } : transaction;
+}
 
 type NwcNotificationClient = {
   subscribeNotifications(
@@ -63,14 +69,32 @@ export class NWCPool {
 
     nwcClient.subscribeNotifications(
       async (notification) => {
-        logger.debug("received notification", { userId, notification });
+        logger.debug("received notification", {
+          userId,
+          notification: { ...notification, notification: redactTransaction(notification.notification) },
+        });
         if (notification.notification_type === "payment_received") {
           const transaction = notification.notification
           try {
+            // A preimage that hashes to another value proves nothing about this
+            // invoice: neither settle it nor publish a zap receipt for it.
+            if (!preimageMatchesPaymentHash(transaction.preimage, transaction.payment_hash)) {
+              logger.warn("nwc preimage mismatch", {
+                event: "nwc_preimage_mismatch",
+                user_id: userId,
+                payment_hash: transaction.payment_hash,
+                source: "notification",
+              });
+              return;
+            }
             await this._db.markInvoiceSettled(userId, transaction)
             await this.publishZap(userId, transaction)
           } catch (error) {
-            logger.error("error processing payment_received notification", { userId, transaction, error });
+            logger.error("error processing payment_received notification", {
+              userId,
+              transaction: redactTransaction(transaction),
+              error,
+            });
           }
         }
       },
@@ -94,7 +118,7 @@ export class NWCPool {
     })
     const relays = requestEvent.tags.find(tag => tag[0] === 'relays')?.slice(1);
     if (!relays || !relays.length) {
-      logger.error("no relays specified in zap request", { user_id: userId, transaction });
+      logger.error("no relays specified in zap request", { user_id: userId, transaction: redactTransaction(transaction) });
       return;
     }
 

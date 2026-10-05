@@ -2162,19 +2162,25 @@ Deno.test({
   async fn() {
     await withRepo(async ({ sql, db }) => {
       const { NWCPool } = await import("../nwc/nwcPool.ts");
+      const { sha256 } = await import("npm:@noble/hashes@1.3.1/sha256");
+      const { bytesToHex, hexToBytes } = await import("npm:@noble/hashes@1.3.1/utils");
+      // A notification is accepted only when its preimage hashes to its payment hash.
+      const hashOf = (preimage: string) => bytesToHex(sha256(hexToBytes(preimage)));
+      const nwcHash = hashOf("11".repeat(32));
+      const sparkHash = hashOf("33".repeat(32));
       const nwcUserId = await seedNwc(sql, "bob", NPUB);
       const sparkUserId = await seedSpark(sql, "alice", NPUB_OTHER, SPARK_KEY);
       await db.createInvoice(nwcUserId, {
         amount: 1000,
         description: "nwc",
         invoice: "pr-nwc-notify",
-        payment_hash: "hash-nwc-notify",
+        payment_hash: nwcHash,
       } as never, { by: "nwc" });
       await db.createInvoice(sparkUserId, {
         amount: 2000,
         description: "spark",
         invoice: "pr-spark-notify",
-        payment_hash: "hash-spark-notify",
+        payment_hash: sparkHash,
       } as never, { by: "spark", receiverPubkey: SPARK_KEY });
 
       type Notify = (notification: unknown) => Promise<void>;
@@ -2192,13 +2198,15 @@ Deno.test({
           notification: { payment_hash: hash, preimage, settled_at: settledAt, invoice: "pr", amount: 1 },
         });
 
-      await notify(nwcUserId, "hash-nwc-notify", "11".repeat(32), 1_700_000_000);
-      await notify(nwcUserId, "hash-nwc-notify", "22".repeat(32), 1_700_000_500);
-      expect((await db.findInvoice("hash-nwc-notify")).preimage).toBe("11".repeat(32));
+      await notify(nwcUserId, nwcHash, "11".repeat(32), 1_700_000_000);
+      // Another preimage for the same hash cannot be the right one: the sha256 check refuses it before the write-once update would.
+      await notify(nwcUserId, nwcHash, "22".repeat(32), 1_700_000_500);
+      expect((await db.findInvoice(nwcHash)).preimage).toBe("11".repeat(32));
 
-      // The Spark owner's NWC subscription (stale or hostile) reporting a preimage for a Spark invoice.
-      await notify(sparkUserId, "hash-spark-notify", "33".repeat(32), 1_700_000_000);
-      const sparkInvoice = await db.findInvoice("hash-spark-notify");
+      // The Spark owner's NWC subscription (stale or hostile) reporting a valid preimage for a Spark invoice:
+      // the check passes, and the repository still refuses to settle an invoice it did not mint over NWC.
+      await notify(sparkUserId, sparkHash, "33".repeat(32), 1_700_000_000);
+      const sparkInvoice = await db.findInvoice(sparkHash);
       expect(sparkInvoice.preimage).toBeNull();
       expect(sparkInvoice.settledAt).toBeNull();
     });

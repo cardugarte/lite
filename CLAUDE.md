@@ -52,10 +52,12 @@ Uses Drizzle ORM with PostgreSQL:
 1. User registers with NWC connection secret and Nostr pubkey via `POST /users`
 2. NWCPool subscribes to payment notifications for the user's wallet
 3. LNURL-pay callback creates an invoice via NWC `makeInvoice` and stores the row
-4. `payment_received` marks the row settled (awaited) and may publish a zap
+4. `payment_received` marks the row settled (awaited) and may publish a zap,
+   but only when the notification's preimage hashes to its payment hash
 5. LUD-21 `GET /lnurlp/:user/verify/:payment_hash`: if the row is unpaid, ask
-   the **owner** wallet with NWC `lookupInvoice` (Hub). Persist preimage when
-   present. Lookup failure returns `settled: false` (poller-safe). Username
+   the **owner** wallet with NWC `lookupInvoice` (Hub). Persist the preimage
+   when present and its sha256 is the payment hash. Lookup failure returns
+   `settled: false` (poller-safe). Username
    must own the invoice. This GET has no rate limit. TravelSats connected /
    Hub-isolated pay uses BOLT11 preimage first; this verify path is the
    no-preimage (QR) fallback, not payer-wallet lookup.

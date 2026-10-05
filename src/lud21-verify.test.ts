@@ -1,12 +1,18 @@
 import { expect } from "jsr:@std/expect";
+import { sha256 } from "npm:@noble/hashes@1.3.1/sha256";
+import { bytesToHex, hexToBytes } from "npm:@noble/hashes@1.3.1/utils";
 import { createMissingSettlementReporter, verifyInvoiceSettlement } from "./lud21-verify.ts";
+
+/** The payment hash a preimage proves, computed here and not by the code under test. */
+const hashOf = (preimage: string) => bytesToHex(sha256(hexToBytes(preimage)));
+const PREIMAGE = "cc".repeat(32);
 
 const invoice = {
   userId: 7,
   settledAt: null as Date | null,
   preimage: null as string | null,
   paymentRequest: "lnbc30n1ptest",
-  paymentHash: "aa".repeat(32),
+  paymentHash: hashOf(PREIMAGE),
   mintedBy: "nwc",
   createdAt: new Date("2026-09-01T00:00:00Z"),
 };
@@ -69,7 +75,7 @@ Deno.test("returns cached settlement without asking the wallet", async () => {
 });
 
 Deno.test("asks Hub via lookupInvoice and settles when a preimage is present", async () => {
-  const preimage = "cc".repeat(32);
+  const preimage = PREIMAGE;
   const persisted: unknown[] = [];
 
   const body = await verifyInvoiceSettlement({
@@ -234,15 +240,73 @@ Deno.test("an NWC invoice owned by an NWC row is looked up and cached", async ()
     ownerDestination: "nwc",
     lookupInvoice: async () => {
       lookups += 1;
-      return { preimage: "ee".repeat(32), settled_at: 1_700_000_000, payment_hash: invoice.paymentHash };
+      return { preimage: PREIMAGE, settled_at: 1_700_000_000, payment_hash: invoice.paymentHash };
     },
     markSettled: async (lookup) => {
       persisted.push(lookup.preimage);
     },
   });
-  expect(body).toEqual({ status: "OK", settled: true, preimage: "ee".repeat(32), pr: invoice.paymentRequest });
+  expect(body).toEqual({ status: "OK", settled: true, preimage: PREIMAGE, pr: invoice.paymentRequest });
   expect(lookups).toEqual(1);
-  expect(persisted).toEqual(["ee".repeat(32)]);
+  expect(persisted).toEqual([PREIMAGE]);
+});
+
+Deno.test("an NWC preimage that does not hash to the payment hash settles nothing", async () => {
+  const wrong = "dd".repeat(32);
+  expect(hashOf(wrong)).not.toEqual(invoice.paymentHash);
+  let persisted = 0;
+  const mismatches: string[] = [];
+  const body = await verifyInvoiceSettlement({
+    invoice,
+    ownerUserId: 7,
+    ownerDestination: "nwc",
+    lookupInvoice: async () => ({
+      preimage: wrong,
+      settled_at: 1_700_000_000,
+      state: "settled",
+      payment_hash: invoice.paymentHash,
+    }),
+    markSettled: async () => {
+      persisted += 1;
+    },
+    onPreimageMismatch: (stored) => void mismatches.push(stored.paymentHash),
+  });
+  expect(body).toEqual(unpaidResult);
+  expect(persisted).toBe(0);
+  expect(mismatches).toEqual([invoice.paymentHash]);
+});
+
+Deno.test("an NWC preimage that is not 32 bytes of hex settles nothing", async () => {
+  for (const preimage of ["not-a-preimage", "cc".repeat(31), "zz".repeat(32)]) {
+    let persisted = 0;
+    const body = await verifyInvoiceSettlement({
+      invoice,
+      ownerUserId: 7,
+      ownerDestination: "nwc",
+      lookupInvoice: async () => ({ preimage, state: "settled", payment_hash: invoice.paymentHash }),
+      markSettled: async () => {
+        persisted += 1;
+      },
+    });
+    expect({ preimage, body, persisted }).toEqual({ preimage, body: unpaidResult, persisted: 0 });
+  }
+});
+
+Deno.test("an NWC preimage is checked against the stored hash, not the hash the wallet echoes", async () => {
+  const wrong = "dd".repeat(32);
+  let persisted = 0;
+  const body = await verifyInvoiceSettlement({
+    invoice,
+    ownerUserId: 7,
+    ownerDestination: "nwc",
+    // The wallet's own answer is self-consistent, but it is for another invoice.
+    lookupInvoice: async () => ({ preimage: wrong, state: "settled", payment_hash: hashOf(wrong) }),
+    markSettled: async () => {
+      persisted += 1;
+    },
+  });
+  expect(body).toEqual(unpaidResult);
+  expect(persisted).toBe(0);
 });
 
 Deno.test("the missing-settlement hook fires only for unsettled Spark invoices", async () => {

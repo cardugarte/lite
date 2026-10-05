@@ -159,6 +159,13 @@ export function createLnurlApp(
         } as nwc.Nip47Transaction);
       },
       onMissingSettlement: reportMissingSettlement,
+      onPreimageMismatch: (stored) =>
+        logger.warn("nwc preimage mismatch", {
+          event: "nwc_preimage_mismatch",
+          user_id: stored.userId,
+          payment_hash: stored.paymentHash,
+          source: "lookup",
+        }),
     });
 
     return c.json(body);

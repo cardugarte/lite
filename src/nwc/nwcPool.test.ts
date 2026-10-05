@@ -1,7 +1,15 @@
 import "../test_setup.ts";
 import { expect } from "jsr:@std/expect";
+import { sha256 } from "npm:@noble/hashes@1.3.1/sha256";
+import { bytesToHex, hexToBytes } from "npm:@noble/hashes@1.3.1/utils";
 import type { DB } from "../db/db.ts";
+import { captureLogs, entriesFor } from "../test_logs.ts";
 import { NWCPool } from "./nwcPool.ts";
+
+/** The payment hash a preimage proves, computed here and not by the code under test. */
+const hashOf = (preimage: string) => bytesToHex(sha256(hexToBytes(preimage)));
+const PREIMAGE_A = "11".repeat(32);
+const PREIMAGE_B = "22".repeat(32);
 
 Deno.test("nwcPool.init skips spark rows and never decrypts them", async () => {
   const decryptCalls: Array<string | null> = [];
@@ -72,41 +80,86 @@ Deno.test("subscribeUser replaces an existing subscription for the same userId",
   expect(closed).toEqual(["first", "second"]);
 });
 
-Deno.test("a payment_received notification settles only through the user-scoped write-once repository call", async () => {
-  const calls: Array<{ userId: number; paymentHash: string; preimage: string }> = [];
+type Delivered = (notification: unknown) => Promise<void>;
+
+/** A pool wired to a fake repository; `deliver` plays a notification into it. */
+function poolWithRepository(markInvoiceSettled: (userId: number, transaction: { payment_hash: string; preimage: string }) => Promise<void>) {
   // Any other repository method would be undefined here and fail the test.
-  const db = {
-    getAllUsers: async () => [],
-    markInvoiceSettled: async (
-      userId: number,
-      transaction: { payment_hash: string; preimage: string },
-    ) => {
-      calls.push({ userId, paymentHash: transaction.payment_hash, preimage: transaction.preimage });
-    },
-  } as unknown as DB;
-  let deliver: ((notification: unknown) => Promise<void>) | undefined;
+  const db = { getAllUsers: async () => [], markInvoiceSettled } as unknown as DB;
+  let deliver: Delivered | undefined;
   const pool = new NWCPool(
     db,
     async (secret) => secret,
     () => ({
       subscribeNotifications: (callback: (notification: never) => Promise<void>) => {
-        deliver = callback as (notification: unknown) => Promise<void>;
+        deliver = callback as Delivered;
       },
       close: () => undefined,
     }),
   );
+  const zaps: Array<{ userId: number; paymentHash: string }> = [];
+  pool.publishZap = async (userId, transaction) => {
+    zaps.push({ userId, paymentHash: transaction.payment_hash });
+  };
   pool.subscribeUser("secret", 5);
-  await deliver!({
-    notification_type: "payment_received",
-    notification: { payment_hash: "hash-a", preimage: "11".repeat(32), settled_at: 1_700_000_000 },
+  return { pool, deliver: (notification: unknown) => deliver!(notification), zaps };
+}
+
+const received = (preimage: string, paymentHash: string = hashOf(preimage)) => ({
+  notification_type: "payment_received",
+  notification: { payment_hash: paymentHash, preimage, settled_at: 1_700_000_000 },
+});
+
+Deno.test("a payment_received notification settles only through the user-scoped write-once repository call", async () => {
+  const calls: Array<{ userId: number; paymentHash: string; preimage: string }> = [];
+  const { deliver } = poolWithRepository(async (userId, transaction) => {
+    calls.push({ userId, paymentHash: transaction.payment_hash, preimage: transaction.preimage });
   });
-  await deliver!({
-    notification_type: "payment_received",
-    notification: { payment_hash: "hash-a", preimage: "22".repeat(32), settled_at: 1_700_000_500 },
-  });
-  await deliver!({ notification_type: "payment_sent", notification: { payment_hash: "hash-b" } });
+  await deliver(received(PREIMAGE_A));
+  // A repeat delivery still reaches the repository: write-once is its job.
+  await deliver(received(PREIMAGE_A));
+  await deliver({ notification_type: "payment_sent", notification: { payment_hash: hashOf(PREIMAGE_B) } });
   expect(calls).toEqual([
-    { userId: 5, paymentHash: "hash-a", preimage: "11".repeat(32) },
-    { userId: 5, paymentHash: "hash-a", preimage: "22".repeat(32) },
+    { userId: 5, paymentHash: hashOf(PREIMAGE_A), preimage: PREIMAGE_A },
+    { userId: 5, paymentHash: hashOf(PREIMAGE_A), preimage: PREIMAGE_A },
   ]);
+});
+
+Deno.test("a notification whose preimage does not hash to its payment_hash settles nothing and publishes no zap", async () => {
+  let writes = 0;
+  const { deliver, zaps } = poolWithRepository(async () => {
+    writes += 1;
+  });
+  const { entries, raw } = await captureLogs(async () => {
+    await deliver(received(PREIMAGE_B, hashOf(PREIMAGE_A)));
+    await deliver(received("not-a-preimage", hashOf(PREIMAGE_A)));
+  });
+  expect(writes).toBe(0);
+  expect(zaps).toEqual([]);
+  const mismatches = entriesFor(entries, "nwc_preimage_mismatch");
+  expect(mismatches.length).toBe(2);
+  expect(mismatches[0].level).toBe("WARN");
+  expect(mismatches[0].args?.payment_hash).toBe(hashOf(PREIMAGE_A));
+  expect(mismatches[0].args?.user_id).toBe(5);
+  expect(raw).not.toContain(PREIMAGE_B);
+});
+
+Deno.test("a valid notification settles the invoice and then publishes the zap", async () => {
+  const order: string[] = [];
+  const { deliver, zaps } = poolWithRepository(async () => {
+    order.push("settle");
+  });
+  await deliver(received(PREIMAGE_A));
+  expect(order).toEqual(["settle"]);
+  expect(zaps).toEqual([{ userId: 5, paymentHash: hashOf(PREIMAGE_A) }]);
+});
+
+Deno.test("no notification log line carries the preimage, on success or on a repository failure", async () => {
+  for (const failing of [false, true]) {
+    const { deliver } = poolWithRepository(async () => {
+      if (failing) throw new Error("database unavailable");
+    });
+    const { raw } = await captureLogs(() => deliver(received(PREIMAGE_A)));
+    expect({ failing, leaked: raw.includes(PREIMAGE_A) }).toEqual({ failing, leaked: false });
+  }
 });

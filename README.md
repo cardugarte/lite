@@ -93,8 +93,13 @@ credential currently on the user row:
 |---------|-------|
 | Already settled | Cached preimage, no lookup. |
 | Minted by Spark | Stored preimage only. A Spark invoice is settled by the webhook alone, whatever the owner's destination is now. |
-| Minted by NWC, owner still on NWC | One NWC `lookupInvoice` with the current secret; a preimage is cached through the write-once path. |
+| Minted by NWC, owner still on NWC | One NWC `lookupInvoice` with the current secret; a preimage is cached through the write-once path, but only when its SHA-256 is the payment hash. |
 | Minted by NWC, owner now on Spark | Cached data only. |
+
+The same rule guards the NWC `payment_received` notification: a preimage whose
+SHA-256 is not the notification's payment hash settles nothing and publishes no
+zap. Either way Lite logs `nwc_preimage_mismatch` (warn, with the payment hash,
+never the preimage).
 
 A lookup failure answers `settled: false` with HTTP 200. A hash that does not
 exist, or belongs to another username, answers `{"status":"ERROR","reason":"Not found"}`

@@ -1,3 +1,5 @@
+import { preimageMatchesPaymentHash } from "./preimage.ts";
+
 export type StoredInvoice = {
   userId: number;
   settledAt: Date | null;
@@ -45,7 +47,8 @@ function settledPreimage(lookup: NwcLookupResult | null): string | null {
  * - settled (cached preimage and `settled_at`): answer from the cache;
  * - minted by Spark: webhook-only, so no lookup of any kind;
  * - minted by NWC while the owner is still on NWC: ask the wallet
- *   (`lookupInvoice`) and cache a preimage through the write-once path;
+ *   (`lookupInvoice`) and cache a preimage through the write-once path, but
+ *   only a preimage whose sha256 is the invoice's payment hash counts;
  * - minted by NWC after the owner moved to Spark: cached data only.
  *
  * A lookup failure stays unpaid so pollers do not 500.
@@ -59,6 +62,8 @@ export async function verifyInvoiceSettlement(input: {
   markSettled: (lookup: NwcLookupResult) => Promise<void>;
   /** Called when an unsettled Spark invoice is verified, so a lost webhook can be reported. */
   onMissingSettlement?: (invoice: StoredInvoice) => void;
+  /** Called when the wallet answers with a preimage that does not hash to the invoice's payment hash. */
+  onPreimageMismatch?: (invoice: StoredInvoice) => void;
 }): Promise<Lud21VerifyResponse> {
   const { invoice } = input;
   if (!invoice || input.ownerUserId === null || invoice.userId !== input.ownerUserId) {
@@ -95,6 +100,10 @@ export async function verifyInvoiceSettlement(input: {
   }
 
   const preimage = settledPreimage(lookup);
+  if (preimage && !preimageMatchesPaymentHash(preimage, invoice.paymentHash)) {
+    input.onPreimageMismatch?.(invoice);
+    return unpaid;
+  }
   if (preimage) {
     try {
       await input.markSettled({ ...lookup, preimage });
