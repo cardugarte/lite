@@ -3,17 +3,24 @@ import { validateZapRequest } from "@nostr/tools/nip57";
 import { Hono } from "hono";
 import { nwc } from "npm:@getalby/sdk";
 import { logger } from "./logger.ts";
-import { BASE_URL } from "./constants.ts";
+import { BASE_URL, INVOICE_EXPIRY_SECS } from "./constants.ts";
 import { DB } from "./db/db.ts";
 import { createMissingSettlementReporter, verifyInvoiceSettlement } from "./lud21-verify.ts";
 import { isSparkUser } from "./spark/destination.ts";
 import type { SparkMinter } from "./spark/minter.ts";
 
+export type LnurlAppOptions = {
+  /** Seconds an invoice stays payable. Defaults to the `INVOICE_EXPIRY_SECS` setting. */
+  invoiceExpirySecs?: number;
+};
+
 export function createLnurlApp(
   db: DB,
   sparkMinter?: SparkMinter,
   now: () => Date = () => new Date(),
+  options: LnurlAppOptions = {},
 ) {
+  const invoiceExpirySecs = options.invoiceExpirySecs ?? INVOICE_EXPIRY_SECS;
   const hono = new Hono();
   // A lost webhook leaves a paid Spark invoice unsettled; this is how it shows up in the logs.
   const reportMissingSettlement = createMissingSettlementReporter({
@@ -65,6 +72,7 @@ export function createLnurlApp(
           receiverIdentityPubkey: user.sparkIdentityPubkey,
           amountSats: Math.floor(+amount / 1000),
           memo: description,
+          expirySecs: invoiceExpirySecs,
         });
         await db.createInvoice(user.id, {
           amount: amountMsats,
@@ -95,6 +103,7 @@ export function createLnurlApp(
         amount: amountMsats,
         description,
         metadata,
+        expiry: invoiceExpirySecs,
       });
 
       await db.createInvoice(user.id, transaction, { by: "nwc" });

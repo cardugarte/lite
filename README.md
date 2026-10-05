@@ -29,7 +29,7 @@ pay the receiver's identity key, and a webhook that settles them.
 | Route | Purpose |
 |-------|---------|
 | `GET /.well-known/lnurlp/:username` | LNURL-pay request. The address in the metadata is `username@<LNURL domain>`; the callback uses `BASE_URL`. |
-| `GET /lnurlp/:username/callback` | Mints an invoice. Spark users get a Spark invoice for their identity key, NWC users an NWC invoice. |
+| `GET /lnurlp/:username/callback` | Mints an invoice that expires after `INVOICE_EXPIRY_SECS` (default 300). Spark users get a Spark invoice for their identity key, NWC users an NWC invoice. |
 | `GET /lnurlp/:username/verify/:payment_hash` | LUD-21 verification, see [Verify](#verify-lud-21). |
 | `GET /.well-known/nostr.json` | NIP-05. |
 
@@ -146,6 +146,7 @@ Names only; set secrets in the environment, never in the repository. Copy
 | `SPARK_MINTER_MNEMONIC` | with minter | Seed of the **minter** wallet only. Distinct per environment. Not a user seed. |
 | `BREEZ_API_KEY` | with minter | Server-side Breez API key for the minter. Never ship it in a client bundle. |
 | `SPARK_MINTER_DATABASE_URL` | no | Connection string for the minter's own storage. Default: `DATABASE_URL` with the search path pinned to the `breez_minter` schema. See [Minter storage](#minter-storage). |
+| `INVOICE_EXPIRY_SECS` | no | Seconds an invoice Lite mints stays payable, for Spark (`expirySecs`) and NWC (`make_invoice` `expiry`). Default 300, the limit the app's payment countdown shows. A whole number from 1 to 4294967295; anything else stops Lite at startup. Without an explicit expiry the Spark SDK mints 30-day invoices. |
 | `NOSTR_NIP57_PRIVATE_KEY` | no | Zapper key, see [NIP-57](https://github.com/nostr-protocol/nips/blob/master/57.md). |
 | `LOG_LEVEL` | no | Log detail. |
 | `PORT` | no | Listen port. Default 8080. |

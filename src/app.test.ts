@@ -6,6 +6,7 @@ import { secp256k1 } from "npm:@noble/curves@1.2.0/secp256k1";
 import { sha256 } from "npm:@noble/hashes@1.3.1/sha256";
 import { utf8ToBytes } from "npm:@noble/hashes@1.3.1/utils";
 import { buildApp } from "./app.ts";
+import { INVOICE_EXPIRY_SECS } from "./constants.ts";
 
 const ORIGIN = "https://dev.travelsats.ar";
 
@@ -217,4 +218,30 @@ Deno.test("every /lnurlpay status observed in this file is in the closed set", (
   const allowed = new Set([200, 204, 400, 403, 404, 409, 413, 500]);
   expect(observedStatuses.length).toBeGreaterThan(8);
   expect([...new Set(observedStatuses)].filter((status) => !allowed.has(status))).toEqual([]);
+});
+
+Deno.test("buildApp hands the invoice expiry to the mint path, and defaults to the setting", async () => {
+  const seen: number[] = [];
+  const db = {
+    findUser: async () => ({
+      id: 1,
+      username: "alice",
+      nostrPubkey: "aa".repeat(32),
+      connectionSecret: null,
+      destination: "spark",
+      sparkIdentityPubkey: "02" + "ab".repeat(32),
+    }),
+    createInvoice: async () => {},
+  } as unknown as DB;
+  const sparkMinter = {
+    createInvoice: async (input: { expirySecs: number }) => {
+      seen.push(input.expirySecs);
+      return { invoice: "lnbc1x", paymentHash: "ee".repeat(32), receiverPubkey: "02" + "ab".repeat(32) };
+    },
+  };
+  const build = (invoiceExpirySecs?: number) =>
+    buildApp({ db, nwcPool: {} as NWCPool, sparkMinter, sparkWebhookSecret: "s", invoiceExpirySecs });
+  await build(90).request("/lnurlp/alice/callback?amount=1000000");
+  await build().request("/lnurlp/alice/callback?amount=1000000");
+  expect(seen).toEqual([90, INVOICE_EXPIRY_SECS]);
 });

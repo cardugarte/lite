@@ -1,6 +1,14 @@
 import "./test_setup.ts";
 import { expect } from "jsr:@std/expect";
-import { DOMAIN, lnurlDomainFromBaseUrl, LNURL_DOMAIN, parseAppOrigins } from "./constants.ts";
+import {
+  DEFAULT_INVOICE_EXPIRY_SECS,
+  DOMAIN,
+  INVOICE_EXPIRY_SECS,
+  lnurlDomainFromBaseUrl,
+  LNURL_DOMAIN,
+  parseAppOrigins,
+  parseInvoiceExpirySecs,
+} from "./constants.ts";
 
 Deno.test("lnurlDomainFromBaseUrl lowercases the host", () => {
   expect(lnurlDomainFromBaseUrl("https://Lite-Dev.TravelSats.AR")).toBe("lite-dev.travelsats.ar");
@@ -38,4 +46,26 @@ Deno.test("parseAppOrigins trims and splits a comma list and drops empty entries
 Deno.test("the module exports one LNURL domain and keeps DOMAIN as an alias", () => {
   expect(LNURL_DOMAIN).toBe(new URL(Deno.env.get("BASE_URL")!).host.toLowerCase());
   expect(DOMAIN).toBe(LNURL_DOMAIN);
+});
+
+Deno.test("an invoice expires after 300 seconds unless INVOICE_EXPIRY_SECS says otherwise", () => {
+  // 300 s is the app's INVOICE_EXPIRY_SECONDS, the limit its payment countdown shows.
+  expect(DEFAULT_INVOICE_EXPIRY_SECS).toBe(300);
+  expect(parseInvoiceExpirySecs(undefined)).toBe(300);
+  expect(parseInvoiceExpirySecs("")).toBe(300);
+  expect(parseInvoiceExpirySecs("   ")).toBe(300);
+  expect(INVOICE_EXPIRY_SECS).toBe(parseInvoiceExpirySecs(Deno.env.get("INVOICE_EXPIRY_SECS")));
+});
+
+Deno.test("parseInvoiceExpirySecs reads a trimmed whole number of seconds", () => {
+  expect(parseInvoiceExpirySecs("120")).toBe(120);
+  expect(parseInvoiceExpirySecs("  600 ")).toBe(600);
+  expect(parseInvoiceExpirySecs("1")).toBe(1);
+  expect(parseInvoiceExpirySecs("4294967295")).toBe(4294967295);
+});
+
+Deno.test("parseInvoiceExpirySecs rejects anything that is not a positive whole number of 32 bits", () => {
+  for (const raw of ["0", "-5", "abc", "12.5", "1e3", "300s", "0x10", "4294967296", "+5"]) {
+    expect(() => parseInvoiceExpirySecs(raw)).toThrow(/INVOICE_EXPIRY_SECS/);
+  }
 });

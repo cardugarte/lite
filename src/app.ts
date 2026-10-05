@@ -24,8 +24,10 @@ export type AppDeps = {
   appOrigins?: string[];
   /** The signed and published LNURL domain. Defaults to `LNURL_DOMAIN`. */
   lnurlDomain?: string;
-  /** Lite's clock for `/lnurlpay/*`. */
+  /** Lite's clock for `/lnurlpay/*` and `/lnurlp/*`. */
   now?: () => Date;
+  /** Seconds an invoice stays payable. Defaults to the `INVOICE_EXPIRY_SECS` setting. */
+  invoiceExpirySecs?: number;
 };
 
 const LNURLPAY_BODY_LIMIT_BYTES = 4096;
@@ -53,7 +55,10 @@ export function buildApp(deps: AppDeps) {
 
   hono.route("/.well-known/lnurlp", createLnurlWellKnownApp(deps.db));
   hono.route("/.well-known/nostr.json", createNostrWellKnownApp(deps.db));
-  hono.route("/lnurlp", createLnurlApp(deps.db, deps.sparkMinter));
+  hono.route(
+    "/lnurlp",
+    createLnurlApp(deps.db, deps.sparkMinter, deps.now, { invoiceExpirySecs: deps.invoiceExpirySecs }),
+  );
   hono.route(
     "/lnurlpay",
     createLnurlpayApp({

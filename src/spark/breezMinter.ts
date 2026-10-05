@@ -172,14 +172,14 @@ export function createBreezSparkMinter(opts: {
     async connect() {
       await sdk();
     },
-    async createInvoice({ receiverIdentityPubkey, amountSats, memo }) {
+    async createInvoice({ receiverIdentityPubkey, amountSats, memo, expirySecs }) {
       const client = await sdk();
       const response = await client.receivePayment({
         paymentMethod: {
           type: "bolt11Invoice",
           description: memo,
           amountSats,
-          expirySecs: undefined,
+          expirySecs,
           paymentHash: undefined,
           receiverIdentityPublicKey: receiverIdentityPubkey,
         },

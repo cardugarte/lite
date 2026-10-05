@@ -19,6 +19,8 @@ export type SparkMinter = {
     receiverIdentityPubkey: string;
     amountSats: number;
     memo: string;
+    /** Seconds until the invoice expires. Left out, the SDK mints 30-day invoices. */
+    expirySecs: number;
   }): Promise<{
     invoice: string;
     paymentHash: string;

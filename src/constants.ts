@@ -51,6 +51,29 @@ export const DATABASE_URL = databaseUrl;
 export const NOSTR_NIP57_PRIVATE_KEY = Deno.env.get("NOSTR_NIP57_PRIVATE_KEY") || "";
 export const NOSTR_NIP57_PUBLIC_KEY = NOSTR_NIP57_PRIVATE_KEY ? getPublicKey(hexToBytes(NOSTR_NIP57_PRIVATE_KEY)) : "";
 
+/**
+ * Seconds an invoice Lite mints stays payable. 300 is the app's
+ * `INVOICE_EXPIRY_SECONDS`, the limit its payment countdown shows, so the
+ * countdown and the invoice end together. Without it the Spark SDK mints
+ * 30-day invoices and an NWC wallet applies its own default.
+ */
+export const DEFAULT_INVOICE_EXPIRY_SECS = 300;
+/** The Spark SDK takes `expirySecs` as an unsigned 32-bit integer. */
+const MAX_INVOICE_EXPIRY_SECS = 4_294_967_295;
+
+/** `INVOICE_EXPIRY_SECS`: unset or blank gives the default; anything but a whole number of seconds from 1 to 2^32 - 1 throws. */
+export function parseInvoiceExpirySecs(raw: string | undefined): number {
+  const value = readEnvValue(raw);
+  if (value === undefined) return DEFAULT_INVOICE_EXPIRY_SECS;
+  const seconds = /^\d+$/.test(value) ? Number(value) : NaN;
+  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > MAX_INVOICE_EXPIRY_SECS) {
+    throw new Error(`INVOICE_EXPIRY_SECS must be a whole number of seconds from 1 to ${MAX_INVOICE_EXPIRY_SECS}, got "${value}"`);
+  }
+  return seconds;
+}
+
+export const INVOICE_EXPIRY_SECS = parseInvoiceExpirySecs(Deno.env.get("INVOICE_EXPIRY_SECS"));
+
 export const BREEZ_API_KEY = Deno.env.get("BREEZ_API_KEY") || "";
 export const SPARK_MINTER_MNEMONIC = Deno.env.get("SPARK_MINTER_MNEMONIC") || "";
 export const SPARK_WEBHOOK_SECRET = Deno.env.get("SPARK_WEBHOOK_SECRET") || "";

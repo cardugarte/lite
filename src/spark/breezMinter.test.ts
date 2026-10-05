@@ -37,6 +37,7 @@ const SPEC_INVOICE =
 const WEBHOOK_URL = "http://lnaddr.test/spark/webhook";
 const WEBHOOK_SECRET = "spark-webhook-secret";
 const DATABASE_URL = "postgres://lite:db-password@db.internal:5432/lite?sslmode=require";
+const EXPIRY_SECS = 300;
 
 Deno.test("main.ts subscribes the minter webhook to the shipped handler", () => {
   const src = Deno.readTextFileSync(new URL("../main.ts", import.meta.url));
@@ -123,6 +124,7 @@ Deno.test("connects then registers SPARK_LIGHTNING_RECEIVE webhook before mintin
     receiverIdentityPubkey: "02" + "ab".repeat(32),
     amountSats: 21,
     memo: "booking",
+    expirySecs: EXPIRY_SECS,
   });
 
   expect(order).toEqual(["connect", "registerWebhook", "receivePayment"]);
@@ -168,6 +170,7 @@ Deno.test("does not mint if webhook registration fails", async () => {
       receiverIdentityPubkey: "02" + "ab".repeat(32),
       amountSats: 21,
       memo: "booking",
+      expirySecs: EXPIRY_SECS,
     }),
   ).rejects.toThrow(/webhook subscribe failed/);
   expect(receiveCalls).toEqual(0);
@@ -202,6 +205,7 @@ Deno.test("retries connect after a failed first sdk() instead of caching the rej
       receiverIdentityPubkey: "02" + "ab".repeat(32),
       amountSats: 21,
       memo: "booking",
+      expirySecs: EXPIRY_SECS,
     }),
   ).rejects.toThrow(/ssp down/);
 
@@ -209,6 +213,7 @@ Deno.test("retries connect after a failed first sdk() instead of caching the rej
     receiverIdentityPubkey: "02" + "ab".repeat(32),
     amountSats: 21,
     memo: "booking",
+    expirySecs: EXPIRY_SECS,
   });
   expect(connects).toEqual(2);
   expect(minted.invoice).toEqual(SPEC_INVOICE);
@@ -281,6 +286,8 @@ type Spies = {
   registered: Array<{ url: string; secret: string; eventTypes: Array<{ type: string }> }>;
   unregistered: string[];
   configs: Array<Record<string, unknown>>;
+  /** The requests `receivePayment` saw. */
+  received: Array<{ paymentMethod: { type: string; description: string; amountSats: number; expirySecs?: number } }>;
   paymentLookups: string[];
 };
 
@@ -296,6 +303,7 @@ function sdkWorld(options: {
     registered: [],
     unregistered: [],
     configs: [],
+    received: [],
     paymentLookups: [],
   };
   const loadBreez = async () => legacyModule({
@@ -317,7 +325,10 @@ function sdkWorld(options: {
           spies.unregistered.push(request.webhookId);
         },
         getInfo: async () => ({ balanceSats: options.balance ?? 0 }),
-        receivePayment: async () => ({ paymentRequest: SPEC_INVOICE }),
+        receivePayment: async (request: Spies["received"][number]) => {
+          spies.received.push(request);
+          return { paymentRequest: SPEC_INVOICE };
+        },
         // The minter must never use these: settlement is webhook-only.
         getPayment: async () => {
           spies.paymentLookups.push("getPayment");
@@ -343,7 +354,17 @@ function sdkWorld(options: {
 }
 
 const mint = (minter: ReturnType<typeof createBreezSparkMinter>) =>
-  minter.createInvoice({ receiverIdentityPubkey: RECEIVER, amountSats: 21, memo: "booking" });
+  minter.createInvoice({ receiverIdentityPubkey: RECEIVER, amountSats: 21, memo: "booking", expirySecs: EXPIRY_SECS });
+
+Deno.test("every invoice is minted with the requested expiry as expirySecs", async () => {
+  const { spies, minter } = sdkWorld();
+  const instance = minter();
+  await captureLogs(async () => {
+    await mint(instance);
+    await instance.createInvoice({ receiverIdentityPubkey: RECEIVER, amountSats: 21, memo: "booking", expirySecs: 120 });
+  });
+  expect(spies.received.map((request) => request.paymentMethod.expirySecs)).toEqual([EXPIRY_SECS, 120]);
+});
 
 Deno.test("an empty webhook list registers once and logs spark_webhook_registered", async () => {
   const { spies, minter } = sdkWorld();

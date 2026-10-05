@@ -1,6 +1,7 @@
 import "./test_setup.ts";
 import { expect } from "jsr:@std/expect";
 import { nwc } from "npm:@getalby/sdk";
+import { INVOICE_EXPIRY_SECS } from "./constants.ts";
 import type { DB } from "./db/db.ts";
 import { createLnurlApp } from "./lnurlp.ts";
 import { logger } from "./logger.ts";
@@ -28,6 +29,7 @@ Deno.test("LNURL callback mints with the row identity pubkey and ignores request
     receiverIdentityPubkey: string;
     amountSats: number;
     memo: string;
+    expirySecs: number;
   }> = [];
   const invoices: unknown[] = [];
   const minter: SparkMinter = {
@@ -58,7 +60,7 @@ Deno.test("LNURL callback mints with the row identity pubkey and ignores request
     pr: "lnbc1sparkinvoice",
   });
   expect(minted).toEqual([
-    { receiverIdentityPubkey: ROW_PUBKEY, amountSats: 2500, memo: "hi" },
+    { receiverIdentityPubkey: ROW_PUBKEY, amountSats: 2500, memo: "hi", expirySecs: INVOICE_EXPIRY_SECS },
   ]);
   expect(invoices).toEqual([{
     userId: 7,
@@ -161,16 +163,17 @@ function minterThatMustNotRun(): SparkMinter {
 }
 
 Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invoice", async () => {
-  const calls: Array<{ secret?: string; amount?: number; description?: string }> = [];
+  const calls: Array<{ secret?: string; amount?: number; description?: string; expiry?: number }> = [];
   const original = nwc.NWCClient.prototype.makeInvoice;
   nwc.NWCClient.prototype.makeInvoice = async function (
     this: { secret?: string },
-    request: { amount?: number; description?: string },
+    request: { amount?: number; description?: string; expiry?: number },
   ) {
     calls.push({
       secret: this.secret,
       amount: request.amount,
       description: request.description,
+      expiry: request.expiry,
     });
     return {
       invoice: "lnbc1nwcinvoice",
@@ -215,6 +218,7 @@ Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invo
       secret: NWC_SECRET,
       amount: 2500000,
       description: "hi",
+      expiry: INVOICE_EXPIRY_SECS,
     }]);
     expect(invoices).toEqual([{
       userId: 3,
@@ -484,4 +488,47 @@ Deno.test("the mint records the receiver key the minter reports, not a value rea
   const res = await createLnurlApp(db, minter).request("/alice/callback?amount=1000000");
   expect(res.status).toEqual(200);
   expect(written).toEqual([{ by: "spark", receiverPubkey: reported }]);
+});
+
+// ---------------------------------------------------------------------------
+// Every invoice carries the configured expiry, so it ends when the payment
+// countdown does. One setting feeds both mint paths.
+// ---------------------------------------------------------------------------
+
+Deno.test("a configured invoice expiry reaches the Spark minter as expirySecs", async () => {
+  const seen: number[] = [];
+  const minter: SparkMinter = {
+    async createInvoice(input) {
+      seen.push(input.expirySecs);
+      return { invoice: "lnbc1sparkinvoice", paymentHash: PAYMENT_HASH, receiverPubkey: ROW_PUBKEY };
+    },
+  };
+  const db = {
+    findUser: async () => sparkUser(),
+    createInvoice: async () => {},
+  } as unknown as DB;
+  const app = createLnurlApp(db, minter, undefined, { invoiceExpirySecs: 120 });
+  expect((await app.request("/alice/callback?amount=1000000")).status).toEqual(200);
+  expect(seen).toEqual([120]);
+});
+
+Deno.test("a configured invoice expiry reaches the NWC wallet as expiry", async () => {
+  const seen: Array<number | undefined> = [];
+  const original = nwc.NWCClient.prototype.makeInvoice;
+  nwc.NWCClient.prototype.makeInvoice = async function (request: { amount?: number; expiry?: number }) {
+    seen.push(request.expiry);
+    return {
+      invoice: "lnbc1nwcinvoice",
+      payment_hash: PAYMENT_HASH,
+      amount: request.amount ?? 0,
+    } as nwc.Nip47Transaction;
+  } as typeof nwc.NWCClient.prototype.makeInvoice;
+  try {
+    const db = { findUser: async () => nwcUser(), createInvoice: async () => {} } as unknown as DB;
+    const app = createLnurlApp(db, undefined, undefined, { invoiceExpirySecs: 120 });
+    expect((await app.request("/bob/callback?amount=1000000")).status).toEqual(200);
+    expect(seen).toEqual([120]);
+  } finally {
+    nwc.NWCClient.prototype.makeInvoice = original;
+  }
 });
