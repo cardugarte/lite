@@ -3,6 +3,7 @@ import { expect } from "jsr:@std/expect";
 import { captureLogs, entriesFor } from "../test_logs.ts";
 import { BREEZ_SDK_SPARK_NODE_SPECIFIER } from "./minter.ts";
 import {
+  createBreezIdentitySigner,
   createBreezSparkMinter,
   resolveSparkWebhookUrl,
   sparkReceiveWebhookUrl,
@@ -630,4 +631,59 @@ Deno.test("main.ts warms the minter through the never-rejecting helper and no st
   expect(main.includes("STORAGE_DIR")).toEqual(false);
   const constants = Deno.readTextFileSync(new URL("../constants.ts", import.meta.url));
   expect(constants.includes("STORAGE_DIR")).toEqual(false);
+});
+
+// ---------------------------------------------------------------------------
+// The identity signer: the SSP session is signed with the minter's own Spark
+// identity, derived offline from the same mnemonic. It signs authentication
+// challenges only; nothing here can send.
+// ---------------------------------------------------------------------------
+
+Deno.test("the identity signer is derived once from the minter mnemonic on mainnet", async () => {
+  const derivations: unknown[][] = [];
+  let loads = 0;
+  const sparkSigner = {
+    getIdentityPublicKey: async () => ({ bytes: [2, 1] }),
+    signAuthenticationChallenge: async () => ({ bytes: [1] }),
+  };
+  const getSigner = createBreezIdentitySigner({
+    mnemonic: MNEMONIC,
+    loadBreez: async () => {
+      loads += 1;
+      return {
+        defaultExternalSigners: (...args: unknown[]) => {
+          derivations.push(args);
+          return { sparkSigner };
+        },
+      };
+    },
+  });
+  const [first, second] = await Promise.all([getSigner(), getSigner()]);
+  expect(first).toBe(sparkSigner);
+  expect(second).toBe(sparkSigner);
+  expect(await getSigner()).toBe(sparkSigner);
+  expect(loads).toEqual(1);
+  expect(derivations).toEqual([[MNEMONIC, undefined, "mainnet"]]);
+});
+
+Deno.test("a failed load of the SDK is not cached: the next call loads again", async () => {
+  let loads = 0;
+  const getSigner = createBreezIdentitySigner({
+    mnemonic: MNEMONIC,
+    loadBreez: async () => {
+      loads += 1;
+      if (loads === 1) throw new Error("wasm failed to load");
+      return {
+        defaultExternalSigners: () => ({
+          sparkSigner: {
+            getIdentityPublicKey: async () => ({ bytes: [2] }),
+            signAuthenticationChallenge: async () => ({ bytes: [1] }),
+          },
+        }),
+      };
+    },
+  });
+  await expect(getSigner()).rejects.toThrow(/wasm failed to load/);
+  expect((await getSigner()).getIdentityPublicKey).toBeDefined();
+  expect(loads).toEqual(2);
 });

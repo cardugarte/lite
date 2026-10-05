@@ -2,6 +2,7 @@ import { logger } from "../logger.ts";
 import { paymentHashFromBolt11 } from "./bolt11.ts";
 import { deriveMinterDatabaseUrl } from "./minterDatabase.ts";
 import { type SparkMinter, type SparkWebhook } from "./minter.ts";
+import type { SparkIdentitySigner } from "./ssp.ts";
 
 type BreezSdk = {
   listWebhooks(): Promise<SparkWebhook[]>;
@@ -44,6 +45,15 @@ type BreezModule = {
       withStorageBackend: (storage: unknown) => { build: () => Promise<BreezSdk> };
     };
   };
+};
+
+/** The part of the SDK's `./nodejs` entry that derives the identity signer. */
+type BreezSignerModule = {
+  defaultExternalSigners: (
+    mnemonic: string,
+    passphrase: string | undefined,
+    network: string,
+  ) => { sparkSigner: SparkIdentitySigner };
 };
 
 // A small pool: the minter makes few concurrent calls and shares the database
@@ -193,11 +203,36 @@ export function createBreezSparkMinter(opts: {
   };
 }
 
-async function loadNodeEntry(): Promise<BreezModule> {
+async function loadNodeEntry(): Promise<BreezModule & BreezSignerModule> {
   const mod = await import("npm:@breeztech/breez-sdk-spark@0.25.0/nodejs") as unknown as
-    & { default?: BreezModule }
-    & BreezModule;
+    & { default?: BreezModule & BreezSignerModule }
+    & BreezModule
+    & BreezSignerModule;
   return mod.default ?? mod;
+}
+
+/**
+ * The minter's Spark identity signer: the SDK's signer handle, derived offline
+ * from the minter mnemonic. It is the identity the minter connects with. Lite
+ * uses it to sign the SSP's authentication challenge and nothing else. The SDK
+ * loads on first use and the handle is kept; a failed load is retried by the
+ * next call.
+ */
+export function createBreezIdentitySigner(opts: {
+  mnemonic: string;
+  loadBreez?: () => Promise<BreezSignerModule>;
+}): () => Promise<SparkIdentitySigner> {
+  let signer: Promise<SparkIdentitySigner> | null = null;
+  return () => {
+    signer ??= (async () => {
+      const breez = opts.loadBreez ? await opts.loadBreez() : await loadNodeEntry();
+      return breez.defaultExternalSigners(opts.mnemonic, undefined, "mainnet").sparkSigner;
+    })().catch((error) => {
+      signer = null;
+      throw error;
+    });
+    return signer;
+  };
 }
 
 /** Removes every secret and any connection-string credentials from an error message. */

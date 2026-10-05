@@ -32,3 +32,13 @@ Deno.test("breezMinter test SDK fake never needs a send method", () => {
   );
   assertNoSendApi(src);
 });
+
+// The SSP client authenticates as the minter and reads its receive requests.
+// That is a lookup, not an SDK payment lookup, and it must never move money:
+// the only GraphQL mutations it may hold are the two authentication steps.
+Deno.test("the SSP client sends no mutation but the two authentication steps", () => {
+  const src = Deno.readTextFileSync(new URL("./ssp.ts", import.meta.url));
+  const mutations = [...src.matchAll(/\bmutation\s+(\w+)/g)].map((match) => match[1]).sort();
+  expect(mutations).toEqual(["GetChallenge", "VerifyChallenge"]);
+  assertNoSendApi(src);
+});
