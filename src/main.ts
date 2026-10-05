@@ -11,7 +11,14 @@ import {
 import { DB, runMigration } from "./db/db.ts";
 import { LOG_LEVEL, logger } from "./logger.ts";
 import { NWCPool } from "./nwc/nwcPool.ts";
-import { createBreezSparkMinter, resolveSparkWebhookUrl, warmUpSparkMinter } from "./spark/breezMinter.ts";
+import {
+  createBreezIdentitySigner,
+  createBreezSparkMinter,
+  resolveSparkWebhookUrl,
+  warmUpSparkMinter,
+} from "./spark/breezMinter.ts";
+import { createSparkReconciler } from "./spark/reconcile.ts";
+import { createSspClient } from "./spark/ssp.ts";
 
 await runMigration();
 
@@ -39,10 +46,20 @@ if (sparkMinter) {
   ]);
 }
 
+// A paid Spark invoice whose webhook was lost is settled from the SSP list when
+// someone asks for its status. It exists wherever the minter does.
+const sparkReconciler = sparkMinter
+  ? createSparkReconciler({
+    db,
+    ssp: createSspClient({ getSigner: createBreezIdentitySigner({ mnemonic: SPARK_MINTER_MNEMONIC }) }),
+  })
+  : undefined;
+
 const hono = buildApp({
   db,
   nwcPool,
   sparkMinter,
+  sparkReconciler,
   sparkWebhookSecret: SPARK_WEBHOOK_SECRET,
 });
 

@@ -1,10 +1,18 @@
 import "./test_setup.ts";
 import { expect } from "jsr:@std/expect";
 import { nwc } from "npm:@getalby/sdk";
+import { sha256 } from "npm:@noble/hashes@1.3.1/sha256";
+import { bytesToHex, hexToBytes } from "npm:@noble/hashes@1.3.1/utils";
+import { INVOICE_EXPIRY_SECS } from "./constants.ts";
 import type { DB } from "./db/db.ts";
 import { createLnurlApp } from "./lnurlp.ts";
 import { logger } from "./logger.ts";
 import type { SparkMinter } from "./spark/minter.ts";
+import { makeInvoice } from "./test_bolt11.ts";
+import { captureLogs, entriesFor } from "./test_logs.ts";
+
+/** The payment hash a preimage proves, computed here and not by the code under test. */
+const hashOf = (preimage: string) => bytesToHex(sha256(hexToBytes(preimage)));
 
 const ROW_PUBKEY =
   "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -28,6 +36,7 @@ Deno.test("LNURL callback mints with the row identity pubkey and ignores request
     receiverIdentityPubkey: string;
     amountSats: number;
     memo: string;
+    expirySecs: number;
   }> = [];
   const invoices: unknown[] = [];
   const minter: SparkMinter = {
@@ -58,7 +67,7 @@ Deno.test("LNURL callback mints with the row identity pubkey and ignores request
     pr: "lnbc1sparkinvoice",
   });
   expect(minted).toEqual([
-    { receiverIdentityPubkey: ROW_PUBKEY, amountSats: 2500, memo: "hi" },
+    { receiverIdentityPubkey: ROW_PUBKEY, amountSats: 2500, memo: "hi", expirySecs: INVOICE_EXPIRY_SECS },
   ]);
   expect(invoices).toEqual([{
     userId: 7,
@@ -100,6 +109,7 @@ Deno.test("LUD-21 spark verify returns settled from persisted preimage without l
       settled: true,
       preimage: PREIMAGE,
       pr: "lnbc1sparkinvoice",
+      payment_status: "paid",
     });
     expect(lookupCalls).toBe(0);
   } finally {
@@ -135,6 +145,7 @@ Deno.test("LUD-21 spark unpaid verify does not construct NWC lookupInvoice", asy
     settled: false,
     preimage: null,
     pr: "lnbc1sparkinvoice",
+    payment_status: "pending",
   });
 });
 
@@ -161,16 +172,17 @@ function minterThatMustNotRun(): SparkMinter {
 }
 
 Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invoice", async () => {
-  const calls: Array<{ secret?: string; amount?: number; description?: string }> = [];
+  const calls: Array<{ secret?: string; amount?: number; description?: string; expiry?: number }> = [];
   const original = nwc.NWCClient.prototype.makeInvoice;
   nwc.NWCClient.prototype.makeInvoice = async function (
     this: { secret?: string },
-    request: { amount?: number; description?: string },
+    request: { amount?: number; description?: string; expiry?: number },
   ) {
     calls.push({
       secret: this.secret,
       amount: request.amount,
       description: request.description,
+      expiry: request.expiry,
     });
     return {
       invoice: "lnbc1nwcinvoice",
@@ -215,6 +227,7 @@ Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invo
       secret: NWC_SECRET,
       amount: 2500000,
       description: "hi",
+      expiry: INVOICE_EXPIRY_SECS,
     }]);
     expect(invoices).toEqual([{
       userId: 3,
@@ -229,6 +242,7 @@ Deno.test("LNURL callback for an NWC user uses makeInvoice and returns that invo
 
 Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the preimage", async () => {
   const preimage = "cc".repeat(32);
+  const paymentHash = hashOf(preimage);
   const lookups: Array<{ secret?: string; paymentHash?: string }> = [];
   const settled: Array<{ userId: number; preimage?: string; paymentHash?: string }> = [];
   const original = nwc.NWCClient.prototype.lookupInvoice;
@@ -253,7 +267,7 @@ Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the pr
       settledAt: null,
       preimage: null,
       paymentRequest: "lnbc1nwcinvoice",
-      paymentHash: PAYMENT_HASH,
+      paymentHash,
       mintedBy: "nwc",
       createdAt: new Date(),
     }),
@@ -271,19 +285,20 @@ Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the pr
 
   try {
     const app = createLnurlApp(db, minterThatMustNotRun());
-    const res = await app.request(`/bob/verify/${PAYMENT_HASH}`);
+    const res = await app.request(`/bob/verify/${paymentHash}`);
     expect(res.status).toEqual(200);
     expect(await res.json()).toEqual({
       status: "OK",
       settled: true,
       preimage,
       pr: "lnbc1nwcinvoice",
+      payment_status: "paid",
     });
-    expect(lookups).toEqual([{ secret: NWC_SECRET, paymentHash: PAYMENT_HASH }]);
+    expect(lookups).toEqual([{ secret: NWC_SECRET, paymentHash }]);
     expect(settled).toEqual([{
       userId: 3,
       preimage,
-      paymentHash: PAYMENT_HASH,
+      paymentHash,
     }]);
   } finally {
     nwc.NWCClient.prototype.lookupInvoice = original;
@@ -294,7 +309,13 @@ Deno.test("unpaid NWC LUD-21 verify calls owner lookupInvoice and settles the pr
 // L9.3: verify follows the invoice, not the user's current credential.
 // ---------------------------------------------------------------------------
 
-const UNPAID_SPARK = { status: "OK", settled: false, preimage: null, pr: "lnbc1sparkinvoice" };
+const UNPAID_SPARK = {
+  status: "OK",
+  settled: false,
+  preimage: null,
+  pr: "lnbc1sparkinvoice",
+  payment_status: "pending",
+};
 
 function storedInvoice(overrides: Record<string, unknown> = {}) {
   return {
@@ -358,6 +379,71 @@ Deno.test("a Spark invoice of a user now on NWC is never looked up on the NWC wa
   }
 });
 
+// Settlement used to be webhook-only, so a Spark invoice was looked up nowhere.
+// The SSP list is now the second source (ADR 0014): it is reached through the
+// reconciler and nowhere else. The NWC wallet and the SDK stay off limits.
+Deno.test("a Spark invoice of a user now on NWC is reconciled through the SSP, never on the NWC wallet or the SDK", async () => {
+  const spy = spyOnNwcLookup();
+  const { minter, calls } = minterWithSdkSpies();
+  const asked: string[] = [];
+  try {
+    const db = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () => storedInvoice(),
+      markInvoiceSettled: async () => {
+        throw new Error("persist must not run");
+      },
+    } as unknown as DB;
+    const sparkReconciler = async (stored: { paymentHash: string }) => {
+      asked.push(stored.paymentHash);
+      return { kind: "unpaid" as const };
+    };
+    const res = await createLnurlApp(db, minter, undefined, { sparkReconciler }).request(`/bob/verify/${PAYMENT_HASH}`);
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual(UNPAID_SPARK);
+    expect(asked).toEqual([PAYMENT_HASH]);
+    expect(spy.calls).toEqual([]);
+    expect(calls).toEqual([]);
+  } finally {
+    spy.restore();
+  }
+});
+
+Deno.test("a lost webhook is recovered at verify time: the reconciler's proof answers settled with the preimage", async () => {
+  const db = {
+    findUser: async () => ({ ...sparkUser(), id: 3 }),
+    findInvoice: async () => storedInvoice(),
+  } as unknown as DB;
+  const sparkReconciler = async () => ({ kind: "paid" as const, preimage: PREIMAGE });
+  const res = await createLnurlApp(db, minterWithSdkSpies().minter, undefined, { sparkReconciler })
+    .request(`/alice/verify/${PAYMENT_HASH}`);
+  expect(res.status).toEqual(200);
+  expect(await res.json()).toEqual({
+    status: "OK",
+    settled: true,
+    preimage: PREIMAGE,
+    pr: "lnbc1sparkinvoice",
+    payment_status: "paid",
+  });
+});
+
+Deno.test("a reconciler that fails answers HTTP 200 pending, never an error", async () => {
+  const db = {
+    findUser: async () => ({ ...sparkUser(), id: 3 }),
+    findInvoice: async () => storedInvoice(),
+  } as unknown as DB;
+  let asked = 0;
+  const sparkReconciler = async () => {
+    asked += 1;
+    throw new Error("ssp unreachable");
+  };
+  const res = await createLnurlApp(db, minterWithSdkSpies().minter, undefined, { sparkReconciler })
+    .request(`/alice/verify/${PAYMENT_HASH}`);
+  expect(res.status).toEqual(200);
+  expect(await res.json()).toEqual(UNPAID_SPARK);
+  expect(asked).toEqual(1);
+});
+
 Deno.test("a Spark invoice settled by webhook verifies as settled after the owner switched to NWC", async () => {
   const spy = spyOnNwcLookup();
   try {
@@ -367,7 +453,13 @@ Deno.test("a Spark invoice settled by webhook verifies as settled after the owne
         storedInvoice({ settledAt: new Date("2026-03-09T12:00:06Z"), preimage: PREIMAGE }),
     } as unknown as DB;
     const res = await createLnurlApp(db, minterWithSdkSpies().minter).request(`/bob/verify/${PAYMENT_HASH}`);
-    expect(await res.json()).toEqual({ status: "OK", settled: true, preimage: PREIMAGE, pr: "lnbc1sparkinvoice" });
+    expect(await res.json()).toEqual({
+      status: "OK",
+      settled: true,
+      preimage: PREIMAGE,
+      pr: "lnbc1sparkinvoice",
+      payment_status: "paid",
+    });
     expect(spy.calls).toEqual([]);
   } finally {
     spy.restore();
@@ -386,7 +478,13 @@ Deno.test("an NWC invoice of a user now on Spark makes no lookup and answers unp
     } as unknown as DB;
     const res = await createLnurlApp(db, minterWithSdkSpies().minter).request(`/alice/verify/${PAYMENT_HASH}`);
     expect(res.status).toEqual(200);
-    expect(await res.json()).toEqual({ status: "OK", settled: false, preimage: null, pr: "lnbc1nwcinvoice" });
+    expect(await res.json()).toEqual({
+      status: "OK",
+      settled: false,
+      preimage: null,
+      pr: "lnbc1nwcinvoice",
+      payment_status: "pending",
+    });
     expect(spy.calls).toEqual([]);
   } finally {
     spy.restore();
@@ -405,7 +503,13 @@ Deno.test("a thrown NWC lookup answers HTTP 200 unpaid, and another user's invoi
     } as unknown as DB;
     const res = await createLnurlApp(db).request(`/bob/verify/${PAYMENT_HASH}`);
     expect(res.status).toEqual(200);
-    expect(await res.json()).toEqual({ status: "OK", settled: false, preimage: null, pr: "lnbc1nwcinvoice" });
+    expect(await res.json()).toEqual({
+      status: "OK",
+      settled: false,
+      preimage: null,
+      pr: "lnbc1nwcinvoice",
+      payment_status: "pending",
+    });
 
     const other = {
       findUser: async () => nwcUser(),
@@ -484,4 +588,142 @@ Deno.test("the mint records the receiver key the minter reports, not a value rea
   const res = await createLnurlApp(db, minter).request("/alice/callback?amount=1000000");
   expect(res.status).toEqual(200);
   expect(written).toEqual([{ by: "spark", receiverPubkey: reported }]);
+});
+
+// ---------------------------------------------------------------------------
+// Every invoice carries the configured expiry, so it ends when the payment
+// countdown does. One setting feeds both mint paths.
+// ---------------------------------------------------------------------------
+
+Deno.test("a configured invoice expiry reaches the Spark minter as expirySecs", async () => {
+  const seen: number[] = [];
+  const minter: SparkMinter = {
+    async createInvoice(input) {
+      seen.push(input.expirySecs);
+      return { invoice: "lnbc1sparkinvoice", paymentHash: PAYMENT_HASH, receiverPubkey: ROW_PUBKEY };
+    },
+  };
+  const db = {
+    findUser: async () => sparkUser(),
+    createInvoice: async () => {},
+  } as unknown as DB;
+  const app = createLnurlApp(db, minter, undefined, { invoiceExpirySecs: 120 });
+  expect((await app.request("/alice/callback?amount=1000000")).status).toEqual(200);
+  expect(seen).toEqual([120]);
+});
+
+Deno.test("a configured invoice expiry reaches the NWC wallet as expiry", async () => {
+  const seen: Array<number | undefined> = [];
+  const original = nwc.NWCClient.prototype.makeInvoice;
+  nwc.NWCClient.prototype.makeInvoice = async function (request: { amount?: number; expiry?: number }) {
+    seen.push(request.expiry);
+    return {
+      invoice: "lnbc1nwcinvoice",
+      payment_hash: PAYMENT_HASH,
+      amount: request.amount ?? 0,
+    } as nwc.Nip47Transaction;
+  } as typeof nwc.NWCClient.prototype.makeInvoice;
+  try {
+    const db = { findUser: async () => nwcUser(), createInvoice: async () => {} } as unknown as DB;
+    const app = createLnurlApp(db, undefined, undefined, { invoiceExpirySecs: 120 });
+    expect((await app.request("/bob/callback?amount=1000000")).status).toEqual(200);
+    expect(seen).toEqual([120]);
+  } finally {
+    nwc.NWCClient.prototype.makeInvoice = original;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// An NWC preimage settles an invoice only when its sha256 is the payment hash.
+// ---------------------------------------------------------------------------
+
+Deno.test("an NWC lookup preimage that hashes to another value answers unpaid, caches nothing and logs the mismatch", async () => {
+  const preimage = "cc".repeat(32);
+  const wrong = "dd".repeat(32);
+  const paymentHash = hashOf(preimage);
+  const original = nwc.NWCClient.prototype.lookupInvoice;
+  nwc.NWCClient.prototype.lookupInvoice = async function () {
+    return { preimage: wrong, settled_at: 1_700_000_000, state: "settled" } as unknown as nwc.Nip47Transaction;
+  } as typeof nwc.NWCClient.prototype.lookupInvoice;
+  try {
+    const db = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () => storedInvoice({ mintedBy: "nwc", paymentRequest: "lnbc1nwcinvoice", paymentHash }),
+      markInvoiceSettled: async () => {
+        throw new Error("persist must not run");
+      },
+    } as unknown as DB;
+    const { result: res, entries, raw } = await captureLogs(async () =>
+      await createLnurlApp(db).request(`/bob/verify/${paymentHash}`)
+    );
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({
+      status: "OK",
+      settled: false,
+      preimage: null,
+      pr: "lnbc1nwcinvoice",
+      payment_status: "pending",
+    });
+    const mismatches = entriesFor(entries, "nwc_preimage_mismatch");
+    expect(mismatches.length).toEqual(1);
+    expect(mismatches[0].level).toEqual("WARN");
+    expect(mismatches[0].args?.payment_hash).toEqual(paymentHash);
+    expect(raw).not.toContain(wrong);
+  } finally {
+    nwc.NWCClient.prototype.lookupInvoice = original;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The answer is paid, pending or expired, read from the stored BOLT11.
+// ---------------------------------------------------------------------------
+
+const MINTED_AT_S = 1_790_000_000;
+
+async function statusesAt(
+  lookup: () => Promise<nwc.Nip47Transaction>,
+  secondsAfterMint: number[],
+): Promise<Array<{ http: number; settled: unknown; status: unknown }>> {
+  const original = nwc.NWCClient.prototype.lookupInvoice;
+  nwc.NWCClient.prototype.lookupInvoice = lookup as typeof nwc.NWCClient.prototype.lookupInvoice;
+  try {
+    const paymentRequest = makeInvoice({ paymentHash: PAYMENT_HASH, timestamp: MINTED_AT_S, expirySecs: 300 });
+    const db = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () => storedInvoice({ mintedBy: "nwc", paymentRequest }),
+    } as unknown as DB;
+    const answers = [];
+    for (const seconds of secondsAfterMint) {
+      const app = createLnurlApp(db, undefined, () => new Date((MINTED_AT_S + seconds) * 1000));
+      const res = await app.request(`/bob/verify/${PAYMENT_HASH}`);
+      const body = await res.json();
+      answers.push({ http: res.status, settled: body.settled, status: body.payment_status });
+    }
+    return answers;
+  } finally {
+    nwc.NWCClient.prototype.lookupInvoice = original;
+  }
+}
+
+Deno.test("verify answers pending before the BOLT11 expiry and expired from it", async () => {
+  const answers = await statusesAt(
+    async () => ({ state: "pending", preimage: null }) as unknown as nwc.Nip47Transaction,
+    [0, 299, 300, 900],
+  );
+  expect(answers).toEqual([
+    { http: 200, settled: false, status: "pending" },
+    { http: 200, settled: false, status: "pending" },
+    { http: 200, settled: false, status: "expired" },
+    { http: 200, settled: false, status: "expired" },
+  ]);
+});
+
+Deno.test("verify answers pending, with HTTP 200, when the wallet cannot be asked, even past the expiry", async () => {
+  const answers = await statusesAt(async () => {
+    throw new Error("relay timeout");
+  }, [0, 900]);
+  expect(answers).toEqual([
+    { http: 200, settled: false, status: "pending" },
+    { http: 200, settled: false, status: "pending" },
+  ]);
 });

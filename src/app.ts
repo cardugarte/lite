@@ -11,6 +11,7 @@ import { createLnurlpayApp, PAYLOAD_TOO_LARGE } from "./lnurlpay/routes.ts";
 import { loggerMiddleware } from "./logger.ts";
 import { NWCPool } from "./nwc/nwcPool.ts";
 import type { SparkMinter } from "./spark/minter.ts";
+import type { SparkReconciler } from "./spark/reconcile.ts";
 import { createSparkWebhookApp } from "./spark/webhook.ts";
 import { createUsersApp } from "./users.ts";
 import { createLnurlWellKnownApp, createNostrWellKnownApp } from "./well-known/index.ts";
@@ -19,13 +20,17 @@ export type AppDeps = {
   db: DB;
   nwcPool: NWCPool;
   sparkMinter?: SparkMinter;
+  /** Settles a Spark invoice whose webhook was lost, from the SSP list. Built where the minter is. */
+  sparkReconciler?: SparkReconciler;
   sparkWebhookSecret: string;
   /** Origins allowed to call `/lnurlpay/*` from a browser. Defaults to `APP_ORIGINS`. */
   appOrigins?: string[];
   /** The signed and published LNURL domain. Defaults to `LNURL_DOMAIN`. */
   lnurlDomain?: string;
-  /** Lite's clock for `/lnurlpay/*`. */
+  /** Lite's clock for `/lnurlpay/*` and `/lnurlp/*`. */
   now?: () => Date;
+  /** Seconds an invoice stays payable. Defaults to the `INVOICE_EXPIRY_SECS` setting. */
+  invoiceExpirySecs?: number;
 };
 
 const LNURLPAY_BODY_LIMIT_BYTES = 4096;
@@ -53,7 +58,13 @@ export function buildApp(deps: AppDeps) {
 
   hono.route("/.well-known/lnurlp", createLnurlWellKnownApp(deps.db));
   hono.route("/.well-known/nostr.json", createNostrWellKnownApp(deps.db));
-  hono.route("/lnurlp", createLnurlApp(deps.db, deps.sparkMinter));
+  hono.route(
+    "/lnurlp",
+    createLnurlApp(deps.db, deps.sparkMinter, deps.now, {
+      invoiceExpirySecs: deps.invoiceExpirySecs,
+      sparkReconciler: deps.sparkReconciler,
+    }),
+  );
   hono.route(
     "/lnurlpay",
     createLnurlpayApp({

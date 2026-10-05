@@ -1,12 +1,23 @@
 import { expect } from "jsr:@std/expect";
-import { createMissingSettlementReporter, verifyInvoiceSettlement } from "./lud21-verify.ts";
+import { sha256 } from "npm:@noble/hashes@1.3.1/sha256";
+import { bytesToHex, hexToBytes } from "npm:@noble/hashes@1.3.1/utils";
+import {
+  createMissingSettlementReporter,
+  type Lud21VerifyOk,
+  verifyInvoiceSettlement,
+} from "./lud21-verify.ts";
+import { makeInvoice } from "./test_bolt11.ts";
+
+/** The payment hash a preimage proves, computed here and not by the code under test. */
+const hashOf = (preimage: string) => bytesToHex(sha256(hexToBytes(preimage)));
+const PREIMAGE = "cc".repeat(32);
 
 const invoice = {
   userId: 7,
   settledAt: null as Date | null,
   preimage: null as string | null,
   paymentRequest: "lnbc30n1ptest",
-  paymentHash: "aa".repeat(32),
+  paymentHash: hashOf(PREIMAGE),
   mintedBy: "nwc",
   createdAt: new Date("2026-09-01T00:00:00Z"),
 };
@@ -65,11 +76,12 @@ Deno.test("returns cached settlement without asking the wallet", async () => {
     settled: true,
     preimage: "bb".repeat(32),
     pr: invoice.paymentRequest,
+    payment_status: "paid",
   });
 });
 
 Deno.test("asks Hub via lookupInvoice and settles when a preimage is present", async () => {
-  const preimage = "cc".repeat(32);
+  const preimage = PREIMAGE;
   const persisted: unknown[] = [];
 
   const body = await verifyInvoiceSettlement({
@@ -92,6 +104,7 @@ Deno.test("asks Hub via lookupInvoice and settles when a preimage is present", a
     settled: true,
     preimage,
     pr: invoice.paymentRequest,
+    payment_status: "paid",
   });
   expect(persisted).toHaveLength(1);
 });
@@ -118,6 +131,7 @@ Deno.test("returns unpaid when Hub says the invoice is still pending", async () 
     settled: false,
     preimage: null,
     pr: invoice.paymentRequest,
+    payment_status: "pending",
   });
   expect(persisted).toBe(0);
 });
@@ -140,6 +154,7 @@ Deno.test("returns unpaid when lookupInvoice fails — never 500 a poller", asyn
     settled: false,
     preimage: null,
     pr: invoice.paymentRequest,
+    payment_status: "pending",
   });
 });
 
@@ -163,6 +178,7 @@ Deno.test("does not report settled:true without a preimage even if Hub state is 
     settled: false,
     preimage: null,
     pr: invoice.paymentRequest,
+    payment_status: "pending",
   });
 });
 
@@ -171,6 +187,7 @@ const unpaidResult = {
   settled: false,
   preimage: null,
   pr: invoice.paymentRequest,
+  payment_status: "pending",
 };
 
 Deno.test("a Spark invoice is never looked up on the NWC wallet, whatever the owner's destination now is", async () => {
@@ -207,7 +224,13 @@ Deno.test("a Spark invoice settled by webhook verifies as settled after the owne
       throw new Error("persist must not run");
     },
   });
-  expect(body).toEqual({ status: "OK", settled: true, preimage: "dd".repeat(32), pr: invoice.paymentRequest });
+  expect(body).toEqual({
+    status: "OK",
+    settled: true,
+    preimage: "dd".repeat(32),
+    pr: invoice.paymentRequest,
+    payment_status: "paid",
+  });
 });
 
 Deno.test("an NWC invoice is not looked up once the owner has moved to Spark", async () => {
@@ -234,15 +257,333 @@ Deno.test("an NWC invoice owned by an NWC row is looked up and cached", async ()
     ownerDestination: "nwc",
     lookupInvoice: async () => {
       lookups += 1;
-      return { preimage: "ee".repeat(32), settled_at: 1_700_000_000, payment_hash: invoice.paymentHash };
+      return { preimage: PREIMAGE, settled_at: 1_700_000_000, payment_hash: invoice.paymentHash };
     },
     markSettled: async (lookup) => {
       persisted.push(lookup.preimage);
     },
   });
-  expect(body).toEqual({ status: "OK", settled: true, preimage: "ee".repeat(32), pr: invoice.paymentRequest });
+  expect(body).toEqual({
+    status: "OK",
+    settled: true,
+    preimage: PREIMAGE,
+    pr: invoice.paymentRequest,
+    payment_status: "paid",
+  });
   expect(lookups).toEqual(1);
-  expect(persisted).toEqual(["ee".repeat(32)]);
+  expect(persisted).toEqual([PREIMAGE]);
+});
+
+Deno.test("an NWC preimage that does not hash to the payment hash settles nothing", async () => {
+  const wrong = "dd".repeat(32);
+  expect(hashOf(wrong)).not.toEqual(invoice.paymentHash);
+  let persisted = 0;
+  const mismatches: string[] = [];
+  const body = await verifyInvoiceSettlement({
+    invoice,
+    ownerUserId: 7,
+    ownerDestination: "nwc",
+    lookupInvoice: async () => ({
+      preimage: wrong,
+      settled_at: 1_700_000_000,
+      state: "settled",
+      payment_hash: invoice.paymentHash,
+    }),
+    markSettled: async () => {
+      persisted += 1;
+    },
+    onPreimageMismatch: (stored) => void mismatches.push(stored.paymentHash),
+  });
+  expect(body).toEqual(unpaidResult);
+  expect(persisted).toBe(0);
+  expect(mismatches).toEqual([invoice.paymentHash]);
+});
+
+Deno.test("an NWC preimage that is not 32 bytes of hex settles nothing", async () => {
+  for (const preimage of ["not-a-preimage", "cc".repeat(31), "zz".repeat(32)]) {
+    let persisted = 0;
+    const body = await verifyInvoiceSettlement({
+      invoice,
+      ownerUserId: 7,
+      ownerDestination: "nwc",
+      lookupInvoice: async () => ({ preimage, state: "settled", payment_hash: invoice.paymentHash }),
+      markSettled: async () => {
+        persisted += 1;
+      },
+    });
+    expect({ preimage, body, persisted }).toEqual({ preimage, body: unpaidResult, persisted: 0 });
+  }
+});
+
+Deno.test("an NWC preimage is checked against the stored hash, not the hash the wallet echoes", async () => {
+  const wrong = "dd".repeat(32);
+  let persisted = 0;
+  const body = await verifyInvoiceSettlement({
+    invoice,
+    ownerUserId: 7,
+    ownerDestination: "nwc",
+    // The wallet's own answer is self-consistent, but it is for another invoice.
+    lookupInvoice: async () => ({ preimage: wrong, state: "settled", payment_hash: hashOf(wrong) }),
+    markSettled: async () => {
+      persisted += 1;
+    },
+  });
+  expect(body).toEqual(unpaidResult);
+  expect(persisted).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// The answer is paid, pending or expired. `settled` keeps its meaning and the
+// LUD-21 `status: "OK"` stays; `payment_status` is the additive field.
+// ---------------------------------------------------------------------------
+
+const MINTED_AT_S = 1_790_000_000;
+const EXPIRY_SECS = 300;
+/** An invoice minted at MINTED_AT_S that expires 300 seconds later. */
+const liveInvoice = {
+  ...invoice,
+  paymentRequest: makeInvoice({ paymentHash: invoice.paymentHash, timestamp: MINTED_AT_S, expirySecs: EXPIRY_SECS }),
+};
+/** Lite's clock `seconds` after the mint. */
+const secondsAfterMint = (seconds: number) => () => new Date((MINTED_AT_S + seconds) * 1000);
+
+const walletSaysPending = async () => ({ state: "pending", preimage: null, payment_hash: invoice.paymentHash });
+const neverPersist = async () => {
+  throw new Error("persist must not run");
+};
+
+function verifyAt(
+  seconds: number,
+  overrides: Partial<Parameters<typeof verifyInvoiceSettlement>[0]> = {},
+) {
+  return verifyInvoiceSettlement({
+    invoice: liveInvoice,
+    ownerUserId: 7,
+    ownerDestination: "nwc",
+    lookupInvoice: walletSaysPending,
+    markSettled: neverPersist,
+    now: secondsAfterMint(seconds),
+    ...overrides,
+  });
+}
+
+/** The answer, which must be the LUD-21 OK envelope. */
+async function verifyOk(
+  seconds: number,
+  overrides: Partial<Parameters<typeof verifyInvoiceSettlement>[0]> = {},
+): Promise<Lud21VerifyOk> {
+  const body = await verifyAt(seconds, overrides);
+  if (body.status !== "OK") throw new Error(`expected an OK answer, got ${body.reason}`);
+  return body;
+}
+
+const statusOf = async (body: Promise<Lud21VerifyOk>) => (await body).payment_status;
+
+Deno.test("an unsettled invoice is pending until its expiry and expired from then on", async () => {
+  expect(await statusOf(verifyOk(0))).toEqual("pending");
+  expect(await statusOf(verifyOk(EXPIRY_SECS - 1))).toEqual("pending");
+  expect(await statusOf(verifyOk(EXPIRY_SECS))).toEqual("expired");
+  expect(await statusOf(verifyOk(10_000))).toEqual("expired");
+});
+
+Deno.test("an expired answer is still the LUD-21 envelope: status OK, settled false, no preimage", async () => {
+  expect(await verifyOk(10_000)).toEqual({
+    status: "OK",
+    settled: false,
+    preimage: null,
+    pr: liveInvoice.paymentRequest,
+    payment_status: "expired",
+  });
+});
+
+Deno.test("a wallet that cannot be asked is pending, never expired, even past the expiry", async () => {
+  const failing = verifyOk(10_000, {
+    lookupInvoice: async () => {
+      throw new Error("relay timeout");
+    },
+  });
+  expect(await failing).toEqual({
+    status: "OK",
+    settled: false,
+    preimage: null,
+    pr: liveInvoice.paymentRequest,
+    payment_status: "pending",
+  });
+});
+
+Deno.test("a wallet answer that contradicts itself is pending, never expired", async () => {
+  const wrong = "dd".repeat(32);
+  const body = await verifyOk(10_000, {
+    lookupInvoice: async () => ({ preimage: wrong, state: "settled", payment_hash: invoice.paymentHash }),
+  });
+  expect(body.settled).toBe(false);
+  expect(await statusOf(Promise.resolve(body))).toEqual("pending");
+});
+
+Deno.test("an invoice nobody can look up is expired once its expiry passes", async () => {
+  // An NWC invoice whose owner moved to Spark: the wallet secret is gone, so there is nothing to ask.
+  const noLookup = { ownerDestination: "spark", lookupInvoice: () => Promise.reject(new Error("never asked")) };
+  expect(await statusOf(verifyOk(EXPIRY_SECS - 1, noLookup))).toEqual("pending");
+  expect(await statusOf(verifyOk(EXPIRY_SECS, noLookup))).toEqual("expired");
+});
+
+Deno.test("a stored payment request that cannot be decoded is pending whatever the time", async () => {
+  for (const seconds of [0, 10_000, 100_000_000]) {
+    const body = await verifyOk(seconds, { invoice });
+    expect({ seconds, status: body.payment_status }).toEqual({ seconds, status: "pending" });
+  }
+});
+
+Deno.test("paid beats expiry: a cached settlement and a late wallet proof both answer paid", async () => {
+  const cached = await verifyOk(10_000, {
+    invoice: { ...liveInvoice, settledAt: new Date(), preimage: PREIMAGE },
+    lookupInvoice: () => Promise.reject(new Error("lookup must not run")),
+  });
+  expect(cached).toEqual({
+    status: "OK",
+    settled: true,
+    preimage: PREIMAGE,
+    pr: liveInvoice.paymentRequest,
+    payment_status: "paid",
+  });
+  const persisted: unknown[] = [];
+  const late = await verifyOk(10_000, {
+    lookupInvoice: async () => ({ preimage: PREIMAGE, settled_at: MINTED_AT_S + 1_000, state: "settled" }),
+    markSettled: async (lookup) => void persisted.push(lookup.preimage),
+  });
+  expect(late.payment_status).toEqual("paid");
+  expect(late.settled).toBe(true);
+  expect(persisted).toEqual([PREIMAGE]);
+});
+
+Deno.test("settled is true exactly when the answer is paid", async () => {
+  const answers = [
+    await verifyOk(0),
+    await verifyOk(10_000),
+    await verifyOk(0, { lookupInvoice: async () => ({ preimage: PREIMAGE, state: "settled" }), markSettled: async () => {} }),
+    await verifyOk(0, { invoice: { ...liveInvoice, settledAt: new Date(), preimage: PREIMAGE } }),
+  ];
+  expect(answers.map((body) => [body.settled, body.payment_status])).toEqual([
+    [false, "pending"],
+    [false, "expired"],
+    [true, "paid"],
+    [true, "paid"],
+  ]);
+});
+
+Deno.test("an unsettled Spark invoice is pending until its expiry and expired after it", async () => {
+  const spark = { invoice: { ...liveInvoice, mintedBy: "spark" }, ownerDestination: "spark" };
+  expect(await statusOf(verifyOk(EXPIRY_SECS - 1, spark))).toEqual("pending");
+  expect(await statusOf(verifyOk(EXPIRY_SECS, spark))).toEqual("expired");
+});
+
+// ---------------------------------------------------------------------------
+// A Spark invoice that is not settled is reconciled through the SSP list, at
+// the moment someone asks. What the reconciler cannot learn is pending.
+// ---------------------------------------------------------------------------
+
+const sparkInvoice = { ...liveInvoice, mintedBy: "spark" };
+const sparkOverrides = (reconcileSpark: NonNullable<Parameters<typeof verifyInvoiceSettlement>[0]["reconcileSpark"]>) => ({
+  invoice: sparkInvoice,
+  ownerDestination: "spark",
+  reconcileSpark,
+  // The NWC wallet is never the place to ask about a Spark invoice.
+  lookupInvoice: () => Promise.reject(new Error("the NWC wallet must not be asked")),
+});
+
+Deno.test("a lost webhook: the reconciler proves the payment and the answer is paid", async () => {
+  const asked: string[] = [];
+  const missing: string[] = [];
+  const body = await verifyOk(0, {
+    ...sparkOverrides(async (stored) => {
+      asked.push(stored.paymentHash);
+      return { kind: "paid", preimage: PREIMAGE };
+    }),
+    onMissingSettlement: (stored) => void missing.push(stored.paymentHash),
+  });
+  expect(body).toEqual({
+    status: "OK",
+    settled: true,
+    preimage: PREIMAGE,
+    pr: sparkInvoice.paymentRequest,
+    payment_status: "paid",
+  });
+  expect(asked).toEqual([invoice.paymentHash]);
+  // Lite found the payment itself: there is no lost webhook left to report.
+  expect(missing).toEqual([]);
+});
+
+Deno.test("a Spark invoice the SSP lists as unpaid is pending until its expiry and expired from it", async () => {
+  const missing: string[] = [];
+  const unpaid = {
+    ...sparkOverrides(async () => ({ kind: "unpaid" as const })),
+    onMissingSettlement: (stored: { paymentHash: string }) => void missing.push(stored.paymentHash),
+  };
+  expect(await statusOf(verifyOk(EXPIRY_SECS - 1, unpaid))).toEqual("pending");
+  expect(await statusOf(verifyOk(EXPIRY_SECS, unpaid))).toEqual("expired");
+  // The SSP was asked and says unpaid: that is not a lost webhook either.
+  expect(missing).toEqual([]);
+});
+
+Deno.test("a Spark invoice whose state cannot be learned is pending, even past the expiry", async () => {
+  const missing: string[] = [];
+  for (const reconcileSpark of [
+    async () => ({ kind: "unknown" as const }),
+    async () => {
+      throw new Error("a reconciler that throws");
+    },
+  ]) {
+    const body = await verifyOk(10_000, {
+      ...sparkOverrides(reconcileSpark),
+      onMissingSettlement: (stored) => void missing.push(stored.paymentHash),
+    });
+    expect(body).toEqual({
+      status: "OK",
+      settled: false,
+      preimage: null,
+      pr: sparkInvoice.paymentRequest,
+      payment_status: "pending",
+    });
+  }
+  // Lite could not check, so a lost webhook cannot be ruled out: it is still reported.
+  expect(missing).toEqual([invoice.paymentHash, invoice.paymentHash]);
+});
+
+Deno.test("a settled Spark invoice and an NWC invoice are never reconciled", async () => {
+  const forbidden = async () => {
+    throw new Error("the reconciler must not run");
+  };
+  const settled = await verifyOk(0, {
+    ...sparkOverrides(forbidden),
+    invoice: { ...sparkInvoice, settledAt: new Date(), preimage: PREIMAGE },
+  });
+  expect(settled.payment_status).toEqual("paid");
+
+  const nwc = await verifyOk(0, { reconcileSpark: forbidden });
+  expect(nwc.payment_status).toEqual("pending");
+});
+
+Deno.test("a Spark invoice is reconciled whatever the owner's destination is now", async () => {
+  for (const ownerDestination of ["nwc", "spark"]) {
+    const asked: string[] = [];
+    const body = await verifyOk(0, {
+      ...sparkOverrides(async (stored) => {
+        asked.push(stored.paymentHash);
+        return { kind: "paid", preimage: PREIMAGE };
+      }),
+      ownerDestination,
+    });
+    expect({ ownerDestination, asked, status: body.payment_status }).toEqual({
+      ownerDestination,
+      asked: [invoice.paymentHash],
+      status: "paid",
+    });
+  }
+});
+
+Deno.test("an error answer carries no payment_status", async () => {
+  const body = await verifyAt(0, { invoice: null });
+  expect(body).toEqual({ status: "ERROR", reason: "Not found" });
 });
 
 Deno.test("the missing-settlement hook fires only for unsettled Spark invoices", async () => {

@@ -32,3 +32,26 @@ Deno.test("breezMinter test SDK fake never needs a send method", () => {
   );
   assertNoSendApi(src);
 });
+
+// The SSP client authenticates as the minter and reads its receive requests.
+// That is a lookup, not an SDK payment lookup, and it must never move money:
+// the only GraphQL mutations it may hold are the two authentication steps.
+Deno.test("the SSP client sends no mutation but the two authentication steps", () => {
+  const src = Deno.readTextFileSync(new URL("./ssp.ts", import.meta.url));
+  const mutations = [...src.matchAll(/\bmutation\s+(\w+)/g)].map((match) => match[1]).sort();
+  expect(mutations).toEqual(["GetChallenge", "VerifyChallenge"]);
+  assertNoSendApi(src);
+});
+
+// Settlement is no longer webhook-only: the reconciler asks the SSP list when a
+// webhook is lost. That is the SSP, not the SDK. The SDK never looks a payment
+// up and never sends, and the reconciler reaches the SSP only through its client.
+Deno.test("the reconciler never sends, never looks a payment up in the SDK, and imports no SDK", () => {
+  const src = Deno.readTextFileSync(new URL("./reconcile.ts", import.meta.url));
+  assertNoSendApi(src);
+  for (const lookup of ["getPayment", "listPayments"]) {
+    expect({ lookup, found: new RegExp(`\\b${lookup}\\b`).test(src) }).toEqual({ lookup, found: false });
+  }
+  expect(src.includes("breez-sdk")).toEqual(false);
+  expect(/from "\.\/breezMinter\.ts"/.test(src)).toEqual(false);
+});

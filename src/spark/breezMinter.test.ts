@@ -3,6 +3,7 @@ import { expect } from "jsr:@std/expect";
 import { captureLogs, entriesFor } from "../test_logs.ts";
 import { BREEZ_SDK_SPARK_NODE_SPECIFIER } from "./minter.ts";
 import {
+  createBreezIdentitySigner,
   createBreezSparkMinter,
   resolveSparkWebhookUrl,
   sparkReceiveWebhookUrl,
@@ -37,6 +38,7 @@ const SPEC_INVOICE =
 const WEBHOOK_URL = "http://lnaddr.test/spark/webhook";
 const WEBHOOK_SECRET = "spark-webhook-secret";
 const DATABASE_URL = "postgres://lite:db-password@db.internal:5432/lite?sslmode=require";
+const EXPIRY_SECS = 300;
 
 Deno.test("main.ts subscribes the minter webhook to the shipped handler", () => {
   const src = Deno.readTextFileSync(new URL("../main.ts", import.meta.url));
@@ -123,6 +125,7 @@ Deno.test("connects then registers SPARK_LIGHTNING_RECEIVE webhook before mintin
     receiverIdentityPubkey: "02" + "ab".repeat(32),
     amountSats: 21,
     memo: "booking",
+    expirySecs: EXPIRY_SECS,
   });
 
   expect(order).toEqual(["connect", "registerWebhook", "receivePayment"]);
@@ -168,6 +171,7 @@ Deno.test("does not mint if webhook registration fails", async () => {
       receiverIdentityPubkey: "02" + "ab".repeat(32),
       amountSats: 21,
       memo: "booking",
+      expirySecs: EXPIRY_SECS,
     }),
   ).rejects.toThrow(/webhook subscribe failed/);
   expect(receiveCalls).toEqual(0);
@@ -202,6 +206,7 @@ Deno.test("retries connect after a failed first sdk() instead of caching the rej
       receiverIdentityPubkey: "02" + "ab".repeat(32),
       amountSats: 21,
       memo: "booking",
+      expirySecs: EXPIRY_SECS,
     }),
   ).rejects.toThrow(/ssp down/);
 
@@ -209,6 +214,7 @@ Deno.test("retries connect after a failed first sdk() instead of caching the rej
     receiverIdentityPubkey: "02" + "ab".repeat(32),
     amountSats: 21,
     memo: "booking",
+    expirySecs: EXPIRY_SECS,
   });
   expect(connects).toEqual(2);
   expect(minted.invoice).toEqual(SPEC_INVOICE);
@@ -281,6 +287,8 @@ type Spies = {
   registered: Array<{ url: string; secret: string; eventTypes: Array<{ type: string }> }>;
   unregistered: string[];
   configs: Array<Record<string, unknown>>;
+  /** The requests `receivePayment` saw. */
+  received: Array<{ paymentMethod: { type: string; description: string; amountSats: number; expirySecs?: number } }>;
   paymentLookups: string[];
 };
 
@@ -296,6 +304,7 @@ function sdkWorld(options: {
     registered: [],
     unregistered: [],
     configs: [],
+    received: [],
     paymentLookups: [],
   };
   const loadBreez = async () => legacyModule({
@@ -317,8 +326,11 @@ function sdkWorld(options: {
           spies.unregistered.push(request.webhookId);
         },
         getInfo: async () => ({ balanceSats: options.balance ?? 0 }),
-        receivePayment: async () => ({ paymentRequest: SPEC_INVOICE }),
-        // The minter must never use these: settlement is webhook-only.
+        receivePayment: async (request: Spies["received"][number]) => {
+          spies.received.push(request);
+          return { paymentRequest: SPEC_INVOICE };
+        },
+        // The minter must never use these: a payment is learned from the webhook or the SSP list, never from an SDK lookup.
         getPayment: async () => {
           spies.paymentLookups.push("getPayment");
           return {};
@@ -343,7 +355,17 @@ function sdkWorld(options: {
 }
 
 const mint = (minter: ReturnType<typeof createBreezSparkMinter>) =>
-  minter.createInvoice({ receiverIdentityPubkey: RECEIVER, amountSats: 21, memo: "booking" });
+  minter.createInvoice({ receiverIdentityPubkey: RECEIVER, amountSats: 21, memo: "booking", expirySecs: EXPIRY_SECS });
+
+Deno.test("every invoice is minted with the requested expiry as expirySecs", async () => {
+  const { spies, minter } = sdkWorld();
+  const instance = minter();
+  await captureLogs(async () => {
+    await mint(instance);
+    await instance.createInvoice({ receiverIdentityPubkey: RECEIVER, amountSats: 21, memo: "booking", expirySecs: 120 });
+  });
+  expect(spies.received.map((request) => request.paymentMethod.expirySecs)).toEqual([EXPIRY_SECS, 120]);
+});
 
 Deno.test("an empty webhook list registers once and logs spark_webhook_registered", async () => {
   const { spies, minter } = sdkWorld();
@@ -609,4 +631,59 @@ Deno.test("main.ts warms the minter through the never-rejecting helper and no st
   expect(main.includes("STORAGE_DIR")).toEqual(false);
   const constants = Deno.readTextFileSync(new URL("../constants.ts", import.meta.url));
   expect(constants.includes("STORAGE_DIR")).toEqual(false);
+});
+
+// ---------------------------------------------------------------------------
+// The identity signer: the SSP session is signed with the minter's own Spark
+// identity, derived offline from the same mnemonic. It signs authentication
+// challenges only; nothing here can send.
+// ---------------------------------------------------------------------------
+
+Deno.test("the identity signer is derived once from the minter mnemonic on mainnet", async () => {
+  const derivations: unknown[][] = [];
+  let loads = 0;
+  const sparkSigner = {
+    getIdentityPublicKey: async () => ({ bytes: [2, 1] }),
+    signAuthenticationChallenge: async () => ({ bytes: [1] }),
+  };
+  const getSigner = createBreezIdentitySigner({
+    mnemonic: MNEMONIC,
+    loadBreez: async () => {
+      loads += 1;
+      return {
+        defaultExternalSigners: (...args: unknown[]) => {
+          derivations.push(args);
+          return { sparkSigner };
+        },
+      };
+    },
+  });
+  const [first, second] = await Promise.all([getSigner(), getSigner()]);
+  expect(first).toBe(sparkSigner);
+  expect(second).toBe(sparkSigner);
+  expect(await getSigner()).toBe(sparkSigner);
+  expect(loads).toEqual(1);
+  expect(derivations).toEqual([[MNEMONIC, undefined, "mainnet"]]);
+});
+
+Deno.test("a failed load of the SDK is not cached: the next call loads again", async () => {
+  let loads = 0;
+  const getSigner = createBreezIdentitySigner({
+    mnemonic: MNEMONIC,
+    loadBreez: async () => {
+      loads += 1;
+      if (loads === 1) throw new Error("wasm failed to load");
+      return {
+        defaultExternalSigners: () => ({
+          sparkSigner: {
+            getIdentityPublicKey: async () => ({ bytes: [2] }),
+            signAuthenticationChallenge: async () => ({ bytes: [1] }),
+          },
+        }),
+      };
+    },
+  });
+  await expect(getSigner()).rejects.toThrow(/wasm failed to load/);
+  expect((await getSigner()).getIdentityPublicKey).toBeDefined();
+  expect(loads).toEqual(2);
 });

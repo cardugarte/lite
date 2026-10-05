@@ -1,3 +1,7 @@
+import { preimageMatchesPaymentHash } from "./preimage.ts";
+import { expiryFromBolt11 } from "./spark/bolt11.ts";
+import type { SparkReconcileOutcome } from "./spark/reconcile.ts";
+
 export type StoredInvoice = {
   userId: number;
   settledAt: Date | null;
@@ -16,11 +20,21 @@ export type NwcLookupResult = {
   payment_hash?: string;
 };
 
+/** What Lite answers for an invoice it minted. */
+export type InvoiceStatus = "paid" | "pending" | "expired";
+
 export type Lud21VerifyOk = {
   status: "OK";
   settled: boolean;
   preimage: string | null;
   pr: string;
+  /**
+   * Additive, outside LUD-21 (whose `status` is the LNURL envelope and stays
+   * "OK"). `paid` exactly when `settled` is true. `expired` once the invoice's
+   * own expiry has passed with no proof of payment. `pending` for everything
+   * else, including every case where Lite could not learn the state.
+   */
+  payment_status: InvoiceStatus;
 };
 
 export type Lud21VerifyErr = {
@@ -29,6 +43,15 @@ export type Lud21VerifyErr = {
 };
 
 export type Lud21VerifyResponse = Lud21VerifyOk | Lud21VerifyErr;
+
+/** True once the invoice's own expiry has passed. An invoice that cannot be decoded has no known expiry, so it is never expired. */
+function isExpired(paymentRequest: string, nowMs: number): boolean {
+  try {
+    return nowMs >= expiryFromBolt11(paymentRequest).expiresAt * 1000;
+  } catch {
+    return false;
+  }
+}
 
 function settledPreimage(lookup: NwcLookupResult | null): string | null {
   if (typeof lookup?.preimage !== "string" || lookup.preimage.length === 0) {
@@ -43,12 +66,19 @@ function settledPreimage(lookup: NwcLookupResult | null): string | null {
  * How to check follows the invoice, not a credential left on the user row:
  *
  * - settled (cached preimage and `settled_at`): answer from the cache;
- * - minted by Spark: webhook-only, so no lookup of any kind;
+ * - minted by Spark: the webhook settles it; when it has not, ask the SSP list
+ *   through `reconcileSpark`, which settles a proven payment write-once. Never
+ *   the NWC wallet, whatever the owner's destination is now, and never the SDK;
  * - minted by NWC while the owner is still on NWC: ask the wallet
- *   (`lookupInvoice`) and cache a preimage through the write-once path;
+ *   (`lookupInvoice`) and cache a preimage through the write-once path, but
+ *   only a preimage whose sha256 is the invoice's payment hash counts;
  * - minted by NWC after the owner moved to Spark: cached data only.
  *
- * A lookup failure stays unpaid so pollers do not 500.
+ * The answer is `paid`, `pending` or `expired`. A lookup that fails or
+ * contradicts itself is `pending`, never "not paid", so pollers do not 500 and
+ * a booking is not failed on a guess. With no lookup, or a lookup that found
+ * no payment, the invoice's own expiry (its BOLT11 timestamp plus expiry)
+ * decides between `pending` and `expired`.
  */
 export async function verifyInvoiceSettlement(input: {
   invoice: StoredInvoice | null;
@@ -57,59 +87,81 @@ export async function verifyInvoiceSettlement(input: {
   ownerDestination: string | null;
   lookupInvoice: () => Promise<NwcLookupResult | null>;
   markSettled: (lookup: NwcLookupResult) => Promise<void>;
-  /** Called when an unsettled Spark invoice is verified, so a lost webhook can be reported. */
+  /**
+   * Looks an unsettled Spark invoice up in the SSP list and settles it when it
+   * was paid. Absent where there is no minter.
+   */
+  reconcileSpark?: (invoice: StoredInvoice) => Promise<SparkReconcileOutcome>;
+  /**
+   * Called when a Spark invoice is unsettled and Lite could not rule out a lost
+   * webhook: it had no way to ask the SSP, or the SSP could not answer.
+   */
   onMissingSettlement?: (invoice: StoredInvoice) => void;
+  /** Called when the wallet answers with a preimage that does not hash to the invoice's payment hash. */
+  onPreimageMismatch?: (invoice: StoredInvoice) => void;
+  /** Lite's clock, for the invoice's expiry. */
+  now?: () => Date;
 }): Promise<Lud21VerifyResponse> {
   const { invoice } = input;
   if (!invoice || input.ownerUserId === null || invoice.userId !== input.ownerUserId) {
     return { status: "ERROR", reason: "Not found" };
   }
 
-  if (invoice.settledAt && invoice.preimage) {
-    return {
-      status: "OK",
-      settled: true,
-      preimage: invoice.preimage,
-      pr: invoice.paymentRequest,
-    };
-  }
-
-  const unpaid: Lud21VerifyOk = {
+  const paid = (preimage: string): Lud21VerifyOk => ({
+    status: "OK",
+    settled: true,
+    preimage,
+    pr: invoice.paymentRequest,
+    payment_status: "paid",
+  });
+  const unpaid = (status: Exclude<InvoiceStatus, "paid">): Lud21VerifyOk => ({
     status: "OK",
     settled: false,
     preimage: null,
     pr: invoice.paymentRequest,
-  };
+    payment_status: status,
+  });
+  /** Nothing proves a payment and nothing failed: the invoice's own clock decides. */
+  const byExpiry = (): Lud21VerifyOk =>
+    unpaid(isExpired(invoice.paymentRequest, (input.now ?? (() => new Date()))().getTime()) ? "expired" : "pending");
+
+  if (invoice.settledAt && invoice.preimage) return paid(invoice.preimage);
 
   if (invoice.mintedBy === "spark") {
-    input.onMissingSettlement?.(invoice);
-    return unpaid;
+    let outcome: SparkReconcileOutcome | null = null;
+    if (input.reconcileSpark) {
+      try {
+        outcome = await input.reconcileSpark(invoice);
+      } catch {
+        outcome = { kind: "unknown" };
+      }
+    }
+    if (outcome?.kind === "paid") return paid(outcome.preimage);
+    // An SSP that answered "unpaid" rules out a lost webhook; anything else does not.
+    if (outcome?.kind !== "unpaid") input.onMissingSettlement?.(invoice);
+    return outcome?.kind === "unknown" ? unpaid("pending") : byExpiry();
   }
-  if (invoice.mintedBy !== "nwc" || input.ownerDestination !== "nwc") return unpaid;
+  if (invoice.mintedBy !== "nwc" || input.ownerDestination !== "nwc") return byExpiry();
 
-  let lookup: NwcLookupResult | null = null;
+  let lookup: NwcLookupResult | null;
   try {
     lookup = await input.lookupInvoice();
   } catch {
-    lookup = null;
+    return unpaid("pending");
   }
 
   const preimage = settledPreimage(lookup);
-  if (preimage) {
-    try {
-      await input.markSettled({ ...lookup, preimage });
-    } catch {
-      // Hub already paid; still return the proof even if the cache write fails.
-    }
-    return {
-      status: "OK",
-      settled: true,
-      preimage,
-      pr: invoice.paymentRequest,
-    };
+  if (!preimage) return byExpiry();
+  if (!preimageMatchesPaymentHash(preimage, invoice.paymentHash)) {
+    input.onPreimageMismatch?.(invoice);
+    return unpaid("pending");
   }
-
-  return unpaid;
+  try {
+    await input.markSettled({ ...lookup, preimage });
+  } catch {
+    // Hub already paid; still return the proof even if the cache write fails.
+  }
+  return paid(preimage);
 }
 
 /** A Spark invoice still unsettled after this long probably lost its webhook. */
