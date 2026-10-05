@@ -101,13 +101,29 @@ SHA-256 is not the notification's payment hash settles nothing and publishes no
 zap. Either way Lite logs `nwc_preimage_mismatch` (warn, with the payment hash,
 never the preimage).
 
-A lookup failure answers `settled: false` with HTTP 200. A hash that does not
-exist, or belongs to another username, answers `{"status":"ERROR","reason":"Not found"}`
-with HTTP 200, as LUD-21 requires.
+A hash that does not exist, or belongs to another username, answers
+`{"status":"ERROR","reason":"Not found"}` with HTTP 200, as LUD-21 requires.
 
 ```json
-{ "status": "OK", "settled": true, "preimage": "...", "pr": "lnbc..." }
+{ "status": "OK", "settled": true, "preimage": "...", "pr": "lnbc...", "payment_status": "paid" }
 ```
+
+`status` stays the LNURL envelope (`OK` or `ERROR`) and `settled` keeps its
+LUD-21 meaning. `payment_status` is the additive field with Lite's three
+answers for an invoice it minted:
+
+| `payment_status` | Meaning |
+|------------------|---------|
+| `paid` | `settled` is `true`: a proven preimage is stored. |
+| `pending` | Not paid yet, **or Lite could not learn the state**: the wallet is unreachable, the lookup failed, or the wallet answered with a preimage that does not hash to the payment hash. Never "not paid", and never an HTTP error. |
+| `expired` | The invoice's own expiry has passed and nothing proves a payment. |
+
+The expiry is read from the stored BOLT11 (its timestamp plus its `x` field, or
+the BOLT11 default of 3600 seconds when there is none), so invoices minted
+before `INVOICE_EXPIRY_SECS` keep the expiry they were minted with. An invoice
+whose BOLT11 cannot be decoded has no known expiry and is never `expired`. A
+lookup that fails, or contradicts itself, is `pending` even past the expiry. A
+payment that is proven later still answers `paid`.
 
 ## How a Spark address gets bound
 

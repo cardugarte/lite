@@ -1,4 +1,5 @@
 import { preimageMatchesPaymentHash } from "./preimage.ts";
+import { expiryFromBolt11 } from "./spark/bolt11.ts";
 
 export type StoredInvoice = {
   userId: number;
@@ -18,11 +19,21 @@ export type NwcLookupResult = {
   payment_hash?: string;
 };
 
+/** What Lite answers for an invoice it minted. */
+export type InvoiceStatus = "paid" | "pending" | "expired";
+
 export type Lud21VerifyOk = {
   status: "OK";
   settled: boolean;
   preimage: string | null;
   pr: string;
+  /**
+   * Additive, outside LUD-21 (whose `status` is the LNURL envelope and stays
+   * "OK"). `paid` exactly when `settled` is true. `expired` once the invoice's
+   * own expiry has passed with no proof of payment. `pending` for everything
+   * else, including every case where Lite could not learn the state.
+   */
+  payment_status: InvoiceStatus;
 };
 
 export type Lud21VerifyErr = {
@@ -31,6 +42,15 @@ export type Lud21VerifyErr = {
 };
 
 export type Lud21VerifyResponse = Lud21VerifyOk | Lud21VerifyErr;
+
+/** True once the invoice's own expiry has passed. An invoice that cannot be decoded has no known expiry, so it is never expired. */
+function isExpired(paymentRequest: string, nowMs: number): boolean {
+  try {
+    return nowMs >= expiryFromBolt11(paymentRequest).expiresAt * 1000;
+  } catch {
+    return false;
+  }
+}
 
 function settledPreimage(lookup: NwcLookupResult | null): string | null {
   if (typeof lookup?.preimage !== "string" || lookup.preimage.length === 0) {
@@ -51,7 +71,11 @@ function settledPreimage(lookup: NwcLookupResult | null): string | null {
  *   only a preimage whose sha256 is the invoice's payment hash counts;
  * - minted by NWC after the owner moved to Spark: cached data only.
  *
- * A lookup failure stays unpaid so pollers do not 500.
+ * The answer is `paid`, `pending` or `expired`. A lookup that fails or
+ * contradicts itself is `pending`, never "not paid", so pollers do not 500 and
+ * a booking is not failed on a guess. With no lookup, or a lookup that found
+ * no payment, the invoice's own expiry (its BOLT11 timestamp plus expiry)
+ * decides between `pending` and `expired`.
  */
 export async function verifyInvoiceSettlement(input: {
   invoice: StoredInvoice | null;
@@ -64,61 +88,59 @@ export async function verifyInvoiceSettlement(input: {
   onMissingSettlement?: (invoice: StoredInvoice) => void;
   /** Called when the wallet answers with a preimage that does not hash to the invoice's payment hash. */
   onPreimageMismatch?: (invoice: StoredInvoice) => void;
+  /** Lite's clock, for the invoice's expiry. */
+  now?: () => Date;
 }): Promise<Lud21VerifyResponse> {
   const { invoice } = input;
   if (!invoice || input.ownerUserId === null || invoice.userId !== input.ownerUserId) {
     return { status: "ERROR", reason: "Not found" };
   }
 
-  if (invoice.settledAt && invoice.preimage) {
-    return {
-      status: "OK",
-      settled: true,
-      preimage: invoice.preimage,
-      pr: invoice.paymentRequest,
-    };
-  }
-
-  const unpaid: Lud21VerifyOk = {
+  const paid = (preimage: string): Lud21VerifyOk => ({
+    status: "OK",
+    settled: true,
+    preimage,
+    pr: invoice.paymentRequest,
+    payment_status: "paid",
+  });
+  const unpaid = (status: Exclude<InvoiceStatus, "paid">): Lud21VerifyOk => ({
     status: "OK",
     settled: false,
     preimage: null,
     pr: invoice.paymentRequest,
-  };
+    payment_status: status,
+  });
+  /** Nothing proves a payment and nothing failed: the invoice's own clock decides. */
+  const byExpiry = (): Lud21VerifyOk =>
+    unpaid(isExpired(invoice.paymentRequest, (input.now ?? (() => new Date()))().getTime()) ? "expired" : "pending");
+
+  if (invoice.settledAt && invoice.preimage) return paid(invoice.preimage);
 
   if (invoice.mintedBy === "spark") {
     input.onMissingSettlement?.(invoice);
-    return unpaid;
+    return byExpiry();
   }
-  if (invoice.mintedBy !== "nwc" || input.ownerDestination !== "nwc") return unpaid;
+  if (invoice.mintedBy !== "nwc" || input.ownerDestination !== "nwc") return byExpiry();
 
-  let lookup: NwcLookupResult | null = null;
+  let lookup: NwcLookupResult | null;
   try {
     lookup = await input.lookupInvoice();
   } catch {
-    lookup = null;
+    return unpaid("pending");
   }
 
   const preimage = settledPreimage(lookup);
-  if (preimage && !preimageMatchesPaymentHash(preimage, invoice.paymentHash)) {
+  if (!preimage) return byExpiry();
+  if (!preimageMatchesPaymentHash(preimage, invoice.paymentHash)) {
     input.onPreimageMismatch?.(invoice);
-    return unpaid;
+    return unpaid("pending");
   }
-  if (preimage) {
-    try {
-      await input.markSettled({ ...lookup, preimage });
-    } catch {
-      // Hub already paid; still return the proof even if the cache write fails.
-    }
-    return {
-      status: "OK",
-      settled: true,
-      preimage,
-      pr: invoice.paymentRequest,
-    };
+  try {
+    await input.markSettled({ ...lookup, preimage });
+  } catch {
+    // Hub already paid; still return the proof even if the cache write fails.
   }
-
-  return unpaid;
+  return paid(preimage);
 }
 
 /** A Spark invoice still unsettled after this long probably lost its webhook. */

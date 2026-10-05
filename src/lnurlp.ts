@@ -159,6 +159,7 @@ export function createLnurlApp(
         } as nwc.Nip47Transaction);
       },
       onMissingSettlement: reportMissingSettlement,
+      now,
       onPreimageMismatch: (stored) =>
         logger.warn("nwc preimage mismatch", {
           event: "nwc_preimage_mismatch",
