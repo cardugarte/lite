@@ -379,6 +379,71 @@ Deno.test("a Spark invoice of a user now on NWC is never looked up on the NWC wa
   }
 });
 
+// Settlement used to be webhook-only, so a Spark invoice was looked up nowhere.
+// The SSP list is now the second source (ADR 0014): it is reached through the
+// reconciler and nowhere else. The NWC wallet and the SDK stay off limits.
+Deno.test("a Spark invoice of a user now on NWC is reconciled through the SSP, never on the NWC wallet or the SDK", async () => {
+  const spy = spyOnNwcLookup();
+  const { minter, calls } = minterWithSdkSpies();
+  const asked: string[] = [];
+  try {
+    const db = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () => storedInvoice(),
+      markInvoiceSettled: async () => {
+        throw new Error("persist must not run");
+      },
+    } as unknown as DB;
+    const sparkReconciler = async (stored: { paymentHash: string }) => {
+      asked.push(stored.paymentHash);
+      return { kind: "unpaid" as const };
+    };
+    const res = await createLnurlApp(db, minter, undefined, { sparkReconciler }).request(`/bob/verify/${PAYMENT_HASH}`);
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual(UNPAID_SPARK);
+    expect(asked).toEqual([PAYMENT_HASH]);
+    expect(spy.calls).toEqual([]);
+    expect(calls).toEqual([]);
+  } finally {
+    spy.restore();
+  }
+});
+
+Deno.test("a lost webhook is recovered at verify time: the reconciler's proof answers settled with the preimage", async () => {
+  const db = {
+    findUser: async () => ({ ...sparkUser(), id: 3 }),
+    findInvoice: async () => storedInvoice(),
+  } as unknown as DB;
+  const sparkReconciler = async () => ({ kind: "paid" as const, preimage: PREIMAGE });
+  const res = await createLnurlApp(db, minterWithSdkSpies().minter, undefined, { sparkReconciler })
+    .request(`/alice/verify/${PAYMENT_HASH}`);
+  expect(res.status).toEqual(200);
+  expect(await res.json()).toEqual({
+    status: "OK",
+    settled: true,
+    preimage: PREIMAGE,
+    pr: "lnbc1sparkinvoice",
+    payment_status: "paid",
+  });
+});
+
+Deno.test("a reconciler that fails answers HTTP 200 pending, never an error", async () => {
+  const db = {
+    findUser: async () => ({ ...sparkUser(), id: 3 }),
+    findInvoice: async () => storedInvoice(),
+  } as unknown as DB;
+  let asked = 0;
+  const sparkReconciler = async () => {
+    asked += 1;
+    throw new Error("ssp unreachable");
+  };
+  const res = await createLnurlApp(db, minterWithSdkSpies().minter, undefined, { sparkReconciler })
+    .request(`/alice/verify/${PAYMENT_HASH}`);
+  expect(res.status).toEqual(200);
+  expect(await res.json()).toEqual(UNPAID_SPARK);
+  expect(asked).toEqual(1);
+});
+
 Deno.test("a Spark invoice settled by webhook verifies as settled after the owner switched to NWC", async () => {
   const spy = spyOnNwcLookup();
   try {

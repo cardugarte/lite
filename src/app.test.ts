@@ -245,3 +245,40 @@ Deno.test("buildApp hands the invoice expiry to the mint path, and defaults to t
   await build().request("/lnurlp/alice/callback?amount=1000000");
   expect(seen).toEqual([90, INVOICE_EXPIRY_SECS]);
 });
+
+Deno.test("buildApp hands the Spark reconciler to the verify route", async () => {
+  const hash = "ee".repeat(32);
+  const preimage = "cc".repeat(32);
+  const asked: string[] = [];
+  const db = {
+    findUser: async () => ({
+      id: 1,
+      username: "alice",
+      nostrPubkey: "aa".repeat(32),
+      connectionSecret: null,
+      destination: "spark",
+      sparkIdentityPubkey: "02" + "ab".repeat(32),
+    }),
+    findInvoice: async () => ({
+      userId: 1,
+      settledAt: null,
+      preimage: null,
+      paymentRequest: "lnbc1x",
+      paymentHash: hash,
+      mintedBy: "spark",
+      createdAt: new Date(),
+    }),
+  } as unknown as DB;
+  const hono = buildApp({
+    db,
+    nwcPool: {} as NWCPool,
+    sparkWebhookSecret: "s",
+    sparkReconciler: async (stored) => {
+      asked.push(stored.paymentHash);
+      return { kind: "paid", preimage };
+    },
+  });
+  const res = await hono.request(`/lnurlp/alice/verify/${hash}`);
+  expect(await res.json()).toEqual({ status: "OK", settled: true, preimage, pr: "lnbc1x", payment_status: "paid" });
+  expect(asked).toEqual([hash]);
+});

@@ -8,10 +8,13 @@ import { DB } from "./db/db.ts";
 import { createMissingSettlementReporter, verifyInvoiceSettlement } from "./lud21-verify.ts";
 import { isSparkUser } from "./spark/destination.ts";
 import type { SparkMinter } from "./spark/minter.ts";
+import type { SparkReconciler } from "./spark/reconcile.ts";
 
 export type LnurlAppOptions = {
   /** Seconds an invoice stays payable. Defaults to the `INVOICE_EXPIRY_SECS` setting. */
   invoiceExpirySecs?: number;
+  /** Settles a Spark invoice whose webhook was lost, from the SSP list. Absent where there is no minter. */
+  sparkReconciler?: SparkReconciler;
 };
 
 export function createLnurlApp(
@@ -158,6 +161,7 @@ export function createLnurlApp(
           settled_at: lookup.settled_at ?? Math.floor(Date.now() / 1000),
         } as nwc.Nip47Transaction);
       },
+      reconcileSpark: options.sparkReconciler,
       onMissingSettlement: reportMissingSettlement,
       now,
       onPreimageMismatch: (stored) =>

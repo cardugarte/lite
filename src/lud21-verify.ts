@@ -1,5 +1,6 @@
 import { preimageMatchesPaymentHash } from "./preimage.ts";
 import { expiryFromBolt11 } from "./spark/bolt11.ts";
+import type { SparkReconcileOutcome } from "./spark/reconcile.ts";
 
 export type StoredInvoice = {
   userId: number;
@@ -65,7 +66,9 @@ function settledPreimage(lookup: NwcLookupResult | null): string | null {
  * How to check follows the invoice, not a credential left on the user row:
  *
  * - settled (cached preimage and `settled_at`): answer from the cache;
- * - minted by Spark: webhook-only, so no lookup of any kind;
+ * - minted by Spark: the webhook settles it; when it has not, ask the SSP list
+ *   through `reconcileSpark`, which settles a proven payment write-once. Never
+ *   the NWC wallet, whatever the owner's destination is now, and never the SDK;
  * - minted by NWC while the owner is still on NWC: ask the wallet
  *   (`lookupInvoice`) and cache a preimage through the write-once path, but
  *   only a preimage whose sha256 is the invoice's payment hash counts;
@@ -84,7 +87,15 @@ export async function verifyInvoiceSettlement(input: {
   ownerDestination: string | null;
   lookupInvoice: () => Promise<NwcLookupResult | null>;
   markSettled: (lookup: NwcLookupResult) => Promise<void>;
-  /** Called when an unsettled Spark invoice is verified, so a lost webhook can be reported. */
+  /**
+   * Looks an unsettled Spark invoice up in the SSP list and settles it when it
+   * was paid. Absent where there is no minter.
+   */
+  reconcileSpark?: (invoice: StoredInvoice) => Promise<SparkReconcileOutcome>;
+  /**
+   * Called when a Spark invoice is unsettled and Lite could not rule out a lost
+   * webhook: it had no way to ask the SSP, or the SSP could not answer.
+   */
   onMissingSettlement?: (invoice: StoredInvoice) => void;
   /** Called when the wallet answers with a preimage that does not hash to the invoice's payment hash. */
   onPreimageMismatch?: (invoice: StoredInvoice) => void;
@@ -117,8 +128,18 @@ export async function verifyInvoiceSettlement(input: {
   if (invoice.settledAt && invoice.preimage) return paid(invoice.preimage);
 
   if (invoice.mintedBy === "spark") {
-    input.onMissingSettlement?.(invoice);
-    return byExpiry();
+    let outcome: SparkReconcileOutcome | null = null;
+    if (input.reconcileSpark) {
+      try {
+        outcome = await input.reconcileSpark(invoice);
+      } catch {
+        outcome = { kind: "unknown" };
+      }
+    }
+    if (outcome?.kind === "paid") return paid(outcome.preimage);
+    // An SSP that answered "unpaid" rules out a lost webhook; anything else does not.
+    if (outcome?.kind !== "unpaid") input.onMissingSettlement?.(invoice);
+    return outcome?.kind === "unknown" ? unpaid("pending") : byExpiry();
   }
   if (invoice.mintedBy !== "nwc" || input.ownerDestination !== "nwc") return byExpiry();
 

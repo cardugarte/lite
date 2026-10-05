@@ -330,7 +330,7 @@ function sdkWorld(options: {
           spies.received.push(request);
           return { paymentRequest: SPEC_INVOICE };
         },
-        // The minter must never use these: settlement is webhook-only.
+        // The minter must never use these: a payment is learned from the webhook or the SSP list, never from an SDK lookup.
         getPayment: async () => {
           spies.paymentLookups.push("getPayment");
           return {};

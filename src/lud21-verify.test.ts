@@ -477,6 +477,110 @@ Deno.test("an unsettled Spark invoice is pending until its expiry and expired af
   expect(await statusOf(verifyOk(EXPIRY_SECS, spark))).toEqual("expired");
 });
 
+// ---------------------------------------------------------------------------
+// A Spark invoice that is not settled is reconciled through the SSP list, at
+// the moment someone asks. What the reconciler cannot learn is pending.
+// ---------------------------------------------------------------------------
+
+const sparkInvoice = { ...liveInvoice, mintedBy: "spark" };
+const sparkOverrides = (reconcileSpark: NonNullable<Parameters<typeof verifyInvoiceSettlement>[0]["reconcileSpark"]>) => ({
+  invoice: sparkInvoice,
+  ownerDestination: "spark",
+  reconcileSpark,
+  // The NWC wallet is never the place to ask about a Spark invoice.
+  lookupInvoice: () => Promise.reject(new Error("the NWC wallet must not be asked")),
+});
+
+Deno.test("a lost webhook: the reconciler proves the payment and the answer is paid", async () => {
+  const asked: string[] = [];
+  const missing: string[] = [];
+  const body = await verifyOk(0, {
+    ...sparkOverrides(async (stored) => {
+      asked.push(stored.paymentHash);
+      return { kind: "paid", preimage: PREIMAGE };
+    }),
+    onMissingSettlement: (stored) => void missing.push(stored.paymentHash),
+  });
+  expect(body).toEqual({
+    status: "OK",
+    settled: true,
+    preimage: PREIMAGE,
+    pr: sparkInvoice.paymentRequest,
+    payment_status: "paid",
+  });
+  expect(asked).toEqual([invoice.paymentHash]);
+  // Lite found the payment itself: there is no lost webhook left to report.
+  expect(missing).toEqual([]);
+});
+
+Deno.test("a Spark invoice the SSP lists as unpaid is pending until its expiry and expired from it", async () => {
+  const missing: string[] = [];
+  const unpaid = {
+    ...sparkOverrides(async () => ({ kind: "unpaid" as const })),
+    onMissingSettlement: (stored: { paymentHash: string }) => void missing.push(stored.paymentHash),
+  };
+  expect(await statusOf(verifyOk(EXPIRY_SECS - 1, unpaid))).toEqual("pending");
+  expect(await statusOf(verifyOk(EXPIRY_SECS, unpaid))).toEqual("expired");
+  // The SSP was asked and says unpaid: that is not a lost webhook either.
+  expect(missing).toEqual([]);
+});
+
+Deno.test("a Spark invoice whose state cannot be learned is pending, even past the expiry", async () => {
+  const missing: string[] = [];
+  for (const reconcileSpark of [
+    async () => ({ kind: "unknown" as const }),
+    async () => {
+      throw new Error("a reconciler that throws");
+    },
+  ]) {
+    const body = await verifyOk(10_000, {
+      ...sparkOverrides(reconcileSpark),
+      onMissingSettlement: (stored) => void missing.push(stored.paymentHash),
+    });
+    expect(body).toEqual({
+      status: "OK",
+      settled: false,
+      preimage: null,
+      pr: sparkInvoice.paymentRequest,
+      payment_status: "pending",
+    });
+  }
+  // Lite could not check, so a lost webhook cannot be ruled out: it is still reported.
+  expect(missing).toEqual([invoice.paymentHash, invoice.paymentHash]);
+});
+
+Deno.test("a settled Spark invoice and an NWC invoice are never reconciled", async () => {
+  const forbidden = async () => {
+    throw new Error("the reconciler must not run");
+  };
+  const settled = await verifyOk(0, {
+    ...sparkOverrides(forbidden),
+    invoice: { ...sparkInvoice, settledAt: new Date(), preimage: PREIMAGE },
+  });
+  expect(settled.payment_status).toEqual("paid");
+
+  const nwc = await verifyOk(0, { reconcileSpark: forbidden });
+  expect(nwc.payment_status).toEqual("pending");
+});
+
+Deno.test("a Spark invoice is reconciled whatever the owner's destination is now", async () => {
+  for (const ownerDestination of ["nwc", "spark"]) {
+    const asked: string[] = [];
+    const body = await verifyOk(0, {
+      ...sparkOverrides(async (stored) => {
+        asked.push(stored.paymentHash);
+        return { kind: "paid", preimage: PREIMAGE };
+      }),
+      ownerDestination,
+    });
+    expect({ ownerDestination, asked, status: body.payment_status }).toEqual({
+      ownerDestination,
+      asked: [invoice.paymentHash],
+      status: "paid",
+    });
+  }
+});
+
 Deno.test("an error answer carries no payment_status", async () => {
   const body = await verifyAt(0, { invoice: null });
   expect(body).toEqual({ status: "ERROR", reason: "Not found" });
