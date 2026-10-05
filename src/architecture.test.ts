@@ -87,3 +87,45 @@ Deno.test("no module imports the DOMAIN alias; addresses use LNURL_DOMAIN", asyn
   }
   expect(hits).toEqual([]);
 });
+
+// ---------------------------------------------------------------------------
+// The documents say what the code does. Settlement is no longer webhook-only
+// (ADR 0014), and what this stage added is written down.
+// ---------------------------------------------------------------------------
+
+const DOCUMENTS = ["README.md", "CLAUDE.md", "src/docs/deployment-guide.md"];
+const repoFile = (path: string) => Deno.readTextFile(new URL(`../${path}`, import.meta.url));
+
+Deno.test("no document says Spark settlement is webhook-only", async () => {
+  const stale = /webhook[- ]only|settled by the webhook alone|accepted gap|no reconciliation job/i;
+  const hits: string[] = [];
+  for (const path of DOCUMENTS) {
+    const match = (await repoFile(path)).match(stale);
+    if (match) hits.push(`${path}: ${match[0]}`);
+  }
+  expect(hits).toEqual([]);
+});
+
+Deno.test("the README documents the expiry setting, the status field and the SSP reconcile", async () => {
+  const readme = await repoFile("README.md");
+  for (const needle of ["INVOICE_EXPIRY_SECS", "payment_status", "Reconciling a lost webhook", "ADR 0014"]) {
+    expect({ needle, documented: readme.includes(needle) }).toEqual({ needle, documented: true });
+  }
+  for (const path of ["CLAUDE.md", "src/docs/deployment-guide.md"]) {
+    const text = await repoFile(path);
+    expect({ path, documented: text.includes("INVOICE_EXPIRY_SECS") || path === "CLAUDE.md" }).toEqual({ path, documented: true });
+  }
+  expect((await repoFile("CLAUDE.md")).includes("spark/reconcile.ts")).toEqual(true);
+});
+
+Deno.test("every event the settlement code logs is in the README", async () => {
+  const events = new Set<string>();
+  for (const file of ["spark/reconcile.ts", "nwc/nwcPool.ts", "lnurlp.ts"]) {
+    const text = await Deno.readTextFile(new URL(`./${file}`, import.meta.url));
+    for (const match of text.matchAll(/event: "([a-z_]+)"/g)) events.add(match[1]);
+  }
+  // The files above log these; a count of zero would mean the scan silently found nothing.
+  expect(events.size).toBeGreaterThanOrEqual(5);
+  const readme = await repoFile("README.md");
+  expect([...events].filter((event) => !readme.includes(`\`${event}\``)).sort()).toEqual([]);
+});

@@ -9,7 +9,10 @@ serves the small part of the Breez management API the Breez SDK needs (register,
 recover, availability) on its own public domain, so the unmodified SDK on the
 device can claim `username@<LNURL domain>` by calling Lite directly. For Spark
 receives Lite holds only a **minter** wallet seed, used to create invoices that
-pay the receiver's identity key, and a webhook that settles them.
+pay the receiver's identity key, and a webhook that settles them. When a webhook
+is lost, Lite settles the invoice from the Spark Service Provider's (SSP) list of
+the minter's receive requests at the moment someone asks for its status; see
+[ADR 0014](https://github.com/cardugarte/travelsats.ar/blob/development/docs/adr/0014-unified-wallet.md).
 
 ## Contents
 
@@ -92,7 +95,7 @@ credential currently on the user row:
 | Invoice | Check |
 |---------|-------|
 | Already settled | Cached preimage, no lookup. |
-| Minted by Spark | Stored preimage only. A Spark invoice is settled by the webhook alone, whatever the owner's destination is now. |
+| Minted by Spark | The stored preimage first. When the webhook has not settled it, one lookup in the SSP list settles it if the SSP proves the payment ([Reconciling a lost webhook](#reconciling-a-lost-webhook)). Never the NWC wallet, whatever the owner's destination is now, and never the SDK. |
 | Minted by NWC, owner still on NWC | One NWC `lookupInvoice` with the current secret; a preimage is cached through the write-once path, but only when its SHA-256 is the payment hash. |
 | Minted by NWC, owner now on Spark | Cached data only. |
 
@@ -164,7 +167,7 @@ Names only; set secrets in the environment, never in the repository. Copy
 | `APP_ORIGINS` | dev only | Comma-separated browser origins allowed on `/lnurlpay/*`. Dev: `https://dev.travelsats.ar`. Unset (prod): the `BASE_URL` origin. |
 | `SPARK_WEBHOOK_URL` | prod | Absolute URL registered with the minter webhook. Default `${BASE_URL}/spark/webhook`. Set it explicitly in prod, where `BASE_URL` is the app and not Lite's own origin (Fly origin plus `/spark/webhook`). Compared as an exact string. |
 | `SPARK_WEBHOOK_SECRET` | with minter | HMAC secret registered with the minter webhook. |
-| `SPARK_MINTER_MNEMONIC` | with minter | Seed of the **minter** wallet only. Distinct per environment. Not a user seed. |
+| `SPARK_MINTER_MNEMONIC` | with minter | Seed of the **minter** wallet only. Distinct per environment. Not a user seed. Its identity also signs the authentication that lets Lite read the minter's receive requests from the SSP. |
 | `BREEZ_API_KEY` | with minter | Server-side Breez API key for the minter. Never ship it in a client bundle. |
 | `SPARK_MINTER_DATABASE_URL` | no | Connection string for the minter's own storage. Default: `DATABASE_URL` with the search path pinned to the `breez_minter` schema. See [Minter storage](#minter-storage). |
 | `INVOICE_EXPIRY_SECS` | no | Seconds an invoice Lite mints stays payable, for Spark (`expirySecs`) and NWC (`make_invoice` `expiry`). Default 300, the limit the app's payment countdown shows. A whole number from 1 to 4294967295; anything else stops Lite at startup. Without an explicit expiry the Spark SDK mints 30-day invoices. |
@@ -174,7 +177,9 @@ Names only; set secrets in the environment, never in the repository. Copy
 | `LITE_TEST_DATABASE_URL` | tests | Disposable Postgres for `deno task test:integration`. Never a real database. |
 
 The minter needs `BREEZ_API_KEY`, `SPARK_MINTER_MNEMONIC`, and
-`SPARK_WEBHOOK_SECRET` together; without all three Lite runs with NWC only.
+`SPARK_WEBHOOK_SECRET` together; without all three Lite runs with NWC only,
+with no webhook and no SSP lookup. The SSP session itself needs no Breez API
+key.
 
 ## CORS
 
@@ -190,16 +195,20 @@ CORS is mounted per route prefix, not globally:
 
 ## Settlement and detection events
 
-A preimage alone is not proof of payment. The webhook settles an invoice only
-when the transfer completed (`request_status` is `SUCCEEDED` and `status` is
-`TRANSFER_COMPLETED`), the invoice was minted by Spark, the SHA-256 of the
-preimage matches its payment hash, and the receiver key, when present, equals
-the key the invoice was minted for (case-insensitive). The write is conditional
-on a missing preimage (write-once) and `settled_at` is the server clock; the
-payload timestamp is ignored.
+A preimage alone is not proof of payment. A Spark invoice settles from two
+sources, and both apply the same rule: the transfer completed (`request_status`
+is `SUCCEEDED` and `status` is `TRANSFER_COMPLETED`), the invoice was minted by
+Spark, the SHA-256 of the preimage matches its payment hash, and the receiver
+key, when present, equals the key the invoice was minted for (case-insensitive).
+The write is conditional on a missing preimage (write-once) and `settled_at` is
+the server clock; a payload timestamp is ignored.
 
-| Outcome | Status |
-|---------|--------|
+- **The webhook** is the fast path: `POST /spark/webhook`, below.
+- **The SSP list** settles an invoice the webhook did not, when its status is
+  asked: [Reconciling a lost webhook](#reconciling-a-lost-webhook).
+
+| Webhook outcome | Status |
+|-----------------|--------|
 | Bad or missing HMAC | `401` |
 | Body is not JSON | `400` |
 | Another event type | `200` |
@@ -211,10 +220,42 @@ payload timestamp is ignored.
 | Valid | `200`, settled once; a repeat is `200` and changes nothing |
 | Database error | `500` |
 
-Settlement is **webhook-only**: with the current SDK the minter cannot look up a
-payment another identity received, and Lite runs no reconciliation job. A lost
-webhook leaves LUD-21 at `settled: false` while the device holds the sats. This
-is an accepted gap, detected by six structured log events (the `event` field):
+### Reconciling a lost webhook
+
+A paid Spark invoice whose webhook never arrived is settled the next time its
+status is asked, on `GET /lnurlp/:username/verify/:payment_hash`. There is no
+cron and no queue.
+
+1. Lite authenticates to the SSP GraphQL API as the minter's own Spark identity:
+   `get_challenge`, a signature from the SDK signer handle (compact, converted to
+   DER), `verify_challenge`. The session lasts about 600 seconds and is cached;
+   a refused session is renewed once. No Breez API key is involved.
+2. It lists `current_user.user_requests(types: [LIGHTNING_RECEIVE])`, newest
+   first, 100 records a page, following the cursor. It stops when it finds the
+   invoice's payment hash, when a page holds entries older than the invoice's
+   creation minus one hour, when the list ends, or after 10 pages.
+3. It turns the record into the webhook's payload and applies the rule above.
+   The SHA-256 of the record's preimage must also be the hash that was asked
+   about. The write is the webhook's write-once update, so a webhook that
+   arrives later changes nothing.
+
+What Lite cannot learn is `pending`, never "not paid": an SSP, signer or
+database failure, or a scan that ran out of pages (an invoice older than the
+newest 1,000 or so receive requests). An invoice is `expired` only when the
+scan finished without proof, or there was nothing to ask, and its own expiry has
+passed. One lookup runs per payment hash at a time, and a lookup that finished
+less than 5 seconds ago is answered from memory, failures included, so a slow or
+failing SSP is not hammered.
+
+The SSP API is not documented. The field names and the authentication flow were
+observed on mainnet on 2026-10-04; [ADR 0014](https://github.com/cardugarte/travelsats.ar/blob/development/docs/adr/0014-unified-wallet.md) records them, the fallback
+(minting through the Spark SDK and querying the request by id), and the halt
+condition if the list stops serving this.
+
+### Log events
+
+Webhook failures and settlements Lite could not confirm show up as structured
+log events (the `event` field):
 
 | Event | Level | When |
 |-------|-------|------|
@@ -223,9 +264,15 @@ is an accepted gap, detected by six structured log events (the `event` field):
 | `spark_webhook_receiver_mismatch` | warn | NWC-minted invoice or receiver key mismatch. |
 | `spark_webhook_non_success` | warn | Present terminal non-success status. |
 | `spark_webhook_receiver_key_absent` | warn | The payload has no receiver key; once per process, with the redacted payload. |
-| `spark_settlement_missing` | warn | Verify saw a Spark invoice still unsettled more than 5 minutes after creation. Once per payment hash per process, at most 1,000 hashes tracked. |
+| `spark_settlement_reconciled` | info | Verify settled an invoice from the SSP list, so its webhook was lost or late. `write` is `settled`, or `already_settled` when the webhook won the race. |
+| `spark_reconcile_failed` | warn | The SSP lookup could not finish (`errorName`, plus `kind` and `http_status` for an SSP error). At most one a minute; `suppressed` counts those held back. |
+| `spark_reconcile_hash_mismatch` | warn | The SSP record carried a preimage that hashes to another invoice. Nothing was settled. |
+| `spark_settlement_missing` | warn | Verify saw a Spark invoice unsettled more than 5 minutes after creation, and Lite could not ask the SSP or the SSP could not answer. Once per payment hash per process, at most 1,000 hashes tracked. |
+| `nwc_preimage_mismatch` | warn | An NWC lookup or notification carried a preimage that does not hash to the payment hash. |
 
-No log entry holds a preimage, the HMAC secret, or a signature header value.
+The webhook rows above also appear with `source: "ssp_list"` when the SSP list,
+not the webhook, was the source. No log entry holds a preimage, the HMAC secret,
+a signature header value, an SSP session token, or a challenge or signature.
 
 The minter also logs `spark_webhook_registered`, `spark_webhook_already_registered`,
 `spark_webhook_stale`, and `spark_minter_balance` at connect. The balance must
@@ -264,6 +311,16 @@ logs `spark_webhook_stale` with the ids of webhooks that point elsewhere. Stale
 ones are **not** deleted, because two environments might share a seed by
 mistake. Remove them by hand with the SDK's `unregisterWebhook`, using the minter
 seed and the ids from the log. Lite has no command for this.
+
+### SSP reconcile
+
+If `spark_reconcile_failed` repeats, read its `kind`. `auth` points at the
+minter mnemonic (it must be the environment's own minter seed); `graphql` or
+`shape` means the SSP API changed; `network` and `http` are the SSP being
+unreachable or overloaded. Meanwhile verify answers `pending`, never an error,
+and the webhook settles as before. If the list stops serving the minter's
+receive requests, follow the fallback and the halt condition in
+[ADR 0014](https://github.com/cardugarte/travelsats.ar/blob/development/docs/adr/0014-unified-wallet.md).
 
 ### Rotating `SPARK_WEBHOOK_SECRET`
 

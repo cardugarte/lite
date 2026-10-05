@@ -25,9 +25,10 @@ This guide covers deploying Alby Lite (Lightning address server powered by NWC) 
 | `ENCRYPTION_KEY` | Yes | AES-GCM key for encrypting NWC secrets |
 | `NOSTR_NIP57_PRIVATE_KEY` | Yes | Private key for signing zap receipts |
 | `BREEZ_API_KEY` | Spark | Server-side Breez API key for the minter. Never put this in a client bundle. |
-| `SPARK_MINTER_MNEMONIC` | Spark | Minter wallet seed only (invoices + creator webhook). Never a user seed. |
-| `SPARK_WEBHOOK_SECRET` | Spark | HMAC secret for `POST /spark/webhook` (`X-Spark-Signature`). After `connect` the minter registers this URL with Breez (`lightningReceiveFinished`) so LUD-21 can persist the preimage. |
+| `SPARK_MINTER_MNEMONIC` | Spark | Minter wallet seed only (invoices, creator webhook, and the SSP authentication that settles a lost webhook). Never a user seed. |
+| `SPARK_WEBHOOK_SECRET` | Spark | HMAC secret for `POST /spark/webhook` (`X-Spark-Signature`). After `connect` the minter registers this URL with Breez (`lightningReceiveFinished`) so LUD-21 can persist the preimage. A webhook that is lost is settled from the SSP list when the invoice's status is asked (ADR 0014). |
 | `SPARK_MINTER_DATABASE_URL` | No | Minter storage connection string (default: `DATABASE_URL` with the `breez_minter` schema) |
+| `INVOICE_EXPIRY_SECS` | No | Seconds an invoice stays payable, Spark and NWC (default: 300, the app's payment countdown) |
 | `LOG_LEVEL` | No | Logging verbosity (DEBUG, INFO, WARN, ERROR) |
 | `PORT` | No | Server port (default: 8080) |
 

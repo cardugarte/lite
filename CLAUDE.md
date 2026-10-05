@@ -36,7 +36,8 @@ deno task cache
 - **users.ts**: User registration (`POST /users`) and single-use rebind (`POST /users/rebind`)
 - **lnurlp.ts**: LNURL-pay callback and LUD-21 verification endpoints
 - **lud21-verify.ts**: GET verify body — cached settle or NWC `lookupInvoice`
-- **spark/**: SparkMinter port, Breez WASM adapter, webhook HMAC, destination routing
+- **spark/**: SparkMinter port, Breez WASM adapter, webhook HMAC, destination routing,
+  the SSP client (`ssp.ts`) and the lost-webhook reconciler (`reconcile.ts`)
 - **nwc/nwcPool.ts**: Manages NWC client subscriptions for all users, handles payment notifications and zap publishing. Skips spark rows.
 - **well-known/**: Serves `.well-known/lnurlp` and `.well-known/nostr.json` endpoints
 
@@ -62,7 +63,9 @@ Uses Drizzle ORM with PostgreSQL:
    passed with no proof). Username
    must own the invoice. This GET has no rate limit. TravelSats connected /
    Hub-isolated pay uses BOLT11 preimage first; this verify path is the
-   no-preimage (QR) fallback, not payer-wallet lookup.
+   no-preimage (QR) fallback, not payer-wallet lookup. A Spark-minted invoice is
+   settled by its webhook; when that has not happened, verify asks the SSP list
+   through `spark/reconcile.ts` (never the NWC wallet, never the SDK).
 
 ## Environment Variables
 
@@ -72,6 +75,8 @@ Required in `.env` (see `.env.example`):
 - `NOSTR_NIP57_PRIVATE_KEY`: Zapper service private key for signing zap receipts
 - `BASE_URL`: Public URL of the server
 - `LOG_LEVEL`: Logging verbosity
+- `INVOICE_EXPIRY_SECS` (optional): seconds an invoice stays payable, Spark and
+  NWC. Default 300, the app's payment countdown
 
 ---
 
@@ -115,7 +120,11 @@ Fork business-logic delta (on top of the deploy/docs commits above):
    secret. LNURL callback mints via `@breeztech/breez-sdk-spark@0.25.0` Deno
    WASM for the **row** identity pubkey (request destination ignored). Creator
    webhook `POST /spark/webhook` HMAC-verifies `X-Spark-Signature` and persists
-   preimage; spark LUD-21 never calls NWC. `nwcPool.init` skips spark rows.
+   preimage; spark LUD-21 never calls NWC or the SDK. A webhook is not the only
+   source any more: when verify finds a Spark invoice unsettled, the reconciler
+   (`spark/reconcile.ts`) looks it up in the SSP list as the minter identity and
+   settles it write-once with the webhook's rule (ADR 0014, travelsats.ar#1634).
+   `nwcPool.init` skips spark rows.
    Rebind is `POST /users/rebind` with nostr pubkey + single-use token. Minter
    seed is not a user seed; no Breez LNURL server; no second Postgres.
 
