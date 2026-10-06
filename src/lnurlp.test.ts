@@ -634,8 +634,63 @@ Deno.test("a configured invoice expiry reaches the NWC wallet as expiry", async 
 });
 
 // ---------------------------------------------------------------------------
-// An NWC preimage settles an invoice only when its sha256 is the payment hash.
+// An NWC lookup settles an invoice only when the wallet reports it settled
+// (`settled_at` or `state`) and the preimage's sha256 is the payment hash. A
+// preimage alone is not proof: NIP-47 makes it optional "if unpaid", and the
+// wallet that created an invoice knows it before anyone pays.
 // ---------------------------------------------------------------------------
+
+/** Runs GET /verify for an unpaid NWC invoice whose wallet answers `lookup_invoice` with `wallet`. */
+async function verifyWithWalletAnswer(wallet: Record<string, unknown>, paymentHash: string) {
+  const original = nwc.NWCClient.prototype.lookupInvoice;
+  nwc.NWCClient.prototype.lookupInvoice = async function () {
+    return wallet as unknown as nwc.Nip47Transaction;
+  } as typeof nwc.NWCClient.prototype.lookupInvoice;
+  try {
+    const cached: Array<{ preimage?: string; settled_at?: number }> = [];
+    const db = {
+      findUser: async () => nwcUser(),
+      findInvoice: async () => storedInvoice({ mintedBy: "nwc", paymentRequest: "lnbc1nwcinvoice", paymentHash }),
+      markInvoiceSettled: async (_userId: number, transaction: { preimage?: string; settled_at?: number }) => {
+        cached.push(transaction);
+      },
+    } as unknown as DB;
+    const res = await createLnurlApp(db).request(`/bob/verify/${paymentHash}`);
+    return { http: res.status, body: await res.json(), cached };
+  } finally {
+    nwc.NWCClient.prototype.lookupInvoice = original;
+  }
+}
+
+Deno.test("an NWC wallet that returns the preimage of an unpaid invoice answers pending and caches nothing", async () => {
+  const preimage = "cc".repeat(32);
+  const paymentHash = hashOf(preimage);
+  const unsettledAnswers = [{ preimage }, { preimage, settled_at: 0 }, { preimage, state: "pending" }];
+  for (const wallet of unsettledAnswers) {
+    const { http, body, cached } = await verifyWithWalletAnswer(wallet, paymentHash);
+    expect({ wallet, http, body, cached }).toEqual({
+      wallet,
+      http: 200,
+      body: { status: "OK", settled: false, preimage: null, pr: "lnbc1nwcinvoice", payment_status: "pending" },
+      cached: [],
+    });
+  }
+});
+
+Deno.test("an NWC wallet that reports the invoice settled, by settled_at or by state, settles it and the preimage is cached", async () => {
+  const preimage = "cc".repeat(32);
+  const paymentHash = hashOf(preimage);
+  for (const wallet of [{ preimage, settled_at: 1_700_000_000 }, { preimage, state: "settled" }]) {
+    const { http, body, cached } = await verifyWithWalletAnswer(wallet, paymentHash);
+    expect({ wallet, http, body }).toEqual({
+      wallet,
+      http: 200,
+      body: { status: "OK", settled: true, preimage, pr: "lnbc1nwcinvoice", payment_status: "paid" },
+    });
+    // Lite's own clock stands in when the wallet reports the state but no time.
+    expect(cached.map((entry) => [entry.preimage, (entry.settled_at ?? 0) > 0])).toEqual([[preimage, true]]);
+  }
+});
 
 Deno.test("an NWC lookup preimage that hashes to another value answers unpaid, caches nothing and logs the mismatch", async () => {
   const preimage = "cc".repeat(32);

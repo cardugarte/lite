@@ -4,6 +4,7 @@ import { bytesToHex, hexToBytes } from "npm:@noble/hashes@1.3.1/utils";
 import {
   createMissingSettlementReporter,
   type Lud21VerifyOk,
+  type NwcLookupResult,
   verifyInvoiceSettlement,
 } from "./lud21-verify.ts";
 import { makeInvoice } from "./test_bolt11.ts";
@@ -469,6 +470,120 @@ Deno.test("settled is true exactly when the answer is paid", async () => {
     [true, "paid"],
     [true, "paid"],
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// A preimage is not proof of payment. NIP-47 makes `preimage` optional "if
+// unpaid", and the wallet that created an invoice knows it before anyone pays
+// (some LND-backed wallets return it for unpaid invoices). An NWC lookup proves
+// a payment only when the wallet reports the invoice settled (`settled_at` is
+// positive or `state` is "settled") AND the preimage hashes to the payment hash.
+// ---------------------------------------------------------------------------
+
+/** What a wallet answers when it holds the invoice's real preimage, plus the given settlement fields. */
+const walletHoldingPreimage = (fields: Partial<NwcLookupResult> = {}) => async (): Promise<NwcLookupResult> => ({
+  preimage: PREIMAGE,
+  payment_hash: invoice.paymentHash,
+  ...fields,
+});
+
+/** A `markSettled` that records what Lite would cache. An unpaid invoice must never reach it. */
+function recordCache() {
+  const cached: NwcLookupResult[] = [];
+  return { cached, markSettled: async (lookup: NwcLookupResult) => void cached.push(lookup) };
+}
+
+const unpaidAnswer = (payment_status: "pending" | "expired") => ({
+  status: "OK",
+  settled: false,
+  preimage: null,
+  pr: liveInvoice.paymentRequest,
+  payment_status,
+});
+
+Deno.test("a matching preimage the wallet does not report settled is pending before the expiry and is not cached", async () => {
+  const { cached, markSettled } = recordCache();
+  const body = await verifyOk(EXPIRY_SECS - 1, { lookupInvoice: walletHoldingPreimage(), markSettled });
+  expect(body).toEqual(unpaidAnswer("pending"));
+  expect(cached).toEqual([]);
+});
+
+Deno.test("a matching preimage the wallet does not report settled is expired from the invoice's expiry on and is not cached", async () => {
+  for (const seconds of [EXPIRY_SECS, 10_000]) {
+    const { cached, markSettled } = recordCache();
+    const body = await verifyOk(seconds, { lookupInvoice: walletHoldingPreimage(), markSettled });
+    expect({ seconds, body, cached }).toEqual({ seconds, body: unpaidAnswer("expired"), cached: [] });
+  }
+});
+
+Deno.test("a matching preimage with state pending, expired or failed is never paid", async () => {
+  for (const state of ["pending", "expired", "failed"]) {
+    const { cached, markSettled } = recordCache();
+    const body = await verifyOk(0, { lookupInvoice: walletHoldingPreimage({ state }), markSettled });
+    expect({ state, body, cached }).toEqual({ state, body: unpaidAnswer("pending"), cached: [] });
+  }
+});
+
+Deno.test("a matching preimage with a positive settled_at is paid and cached", async () => {
+  const { cached, markSettled } = recordCache();
+  const body = await verifyOk(0, { lookupInvoice: walletHoldingPreimage({ settled_at: 1_700_000_000 }), markSettled });
+  expect(body).toEqual({
+    status: "OK",
+    settled: true,
+    preimage: PREIMAGE,
+    pr: liveInvoice.paymentRequest,
+    payment_status: "paid",
+  });
+  expect(cached).toEqual([{ preimage: PREIMAGE, payment_hash: invoice.paymentHash, settled_at: 1_700_000_000 }]);
+});
+
+Deno.test("a matching preimage with state settled is paid and cached", async () => {
+  const { cached, markSettled } = recordCache();
+  const body = await verifyOk(0, { lookupInvoice: walletHoldingPreimage({ state: "settled" }), markSettled });
+  expect(body).toEqual({
+    status: "OK",
+    settled: true,
+    preimage: PREIMAGE,
+    pr: liveInvoice.paymentRequest,
+    payment_status: "paid",
+  });
+  expect(cached).toEqual([{ preimage: PREIMAGE, payment_hash: invoice.paymentHash, state: "settled" }]);
+});
+
+Deno.test("a settled_at with a mismatched preimage is still pending, never expired, and is not cached", async () => {
+  const wrong = "dd".repeat(32);
+  expect(hashOf(wrong)).not.toEqual(invoice.paymentHash);
+  for (const seconds of [0, 10_000]) {
+    const { cached, markSettled } = recordCache();
+    const body = await verifyOk(seconds, {
+      lookupInvoice: walletHoldingPreimage({ preimage: wrong, settled_at: 1_700_000_000 }),
+      markSettled,
+    });
+    expect({ seconds, body, cached }).toEqual({ seconds, body: unpaidAnswer("pending"), cached: [] });
+  }
+});
+
+Deno.test("a settled_at next to a state that did not settle is a wallet contradicting itself: pending, never paid, never expired", async () => {
+  for (const state of ["pending", "expired", "failed"]) {
+    const { cached, markSettled } = recordCache();
+    const body = await verifyOk(10_000, {
+      lookupInvoice: walletHoldingPreimage({ settled_at: 1_700_000_000, state }),
+      markSettled,
+    });
+    expect({ state, body, cached }).toEqual({ state, body: unpaidAnswer("pending"), cached: [] });
+  }
+});
+
+Deno.test("a settled_at that is not a positive number is not a settlement", async () => {
+  const notPositive = [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "1700000000", null];
+  for (const settled_at of notPositive) {
+    const { cached, markSettled } = recordCache();
+    const body = await verifyOk(0, {
+      lookupInvoice: walletHoldingPreimage({ settled_at } as unknown as Partial<NwcLookupResult>),
+      markSettled,
+    });
+    expect({ settled_at, body, cached }).toEqual({ settled_at, body: unpaidAnswer("pending"), cached: [] });
+  }
 });
 
 Deno.test("an unsettled Spark invoice is pending until its expiry and expired after it", async () => {

@@ -13,9 +13,16 @@ export type StoredInvoice = {
   createdAt: Date;
 };
 
+/**
+ * What an NWC `lookup_invoice` answers. Whether the invoice is paid is read from
+ * `settled_at` and `state` only: `preimage` is a claim that proves a payment only
+ * next to them (see `walletSettlement`).
+ */
 export type NwcLookupResult = {
   preimage?: string | null;
+  /** Unix seconds. Positive once the wallet has settled the invoice. */
   settled_at?: number;
+  /** NIP-47 invoice state: "pending", "settled", "expired" or "failed". */
   state?: string;
   payment_hash?: string;
 };
@@ -53,7 +60,29 @@ function isExpired(paymentRequest: string, nowMs: number): boolean {
   }
 }
 
-function settledPreimage(lookup: NwcLookupResult | null): string | null {
+/** What the wallet itself says about settlement. */
+type WalletSettlement = "settled" | "unsettled" | "contradictory";
+
+/**
+ * Whether the wallet reports the invoice settled, from `settled_at` and `state`
+ * alone and never from the preimage: NIP-47 makes `preimage` optional "if
+ * unpaid", and the wallet that created an invoice knows its preimage before
+ * anyone pays (some LND-backed wallets return it for unpaid invoices).
+ *
+ * Settled is a positive `settled_at` or a `state` of "settled". A `state` of
+ * "pending", "expired" or "failed" is never paid: next to a positive
+ * `settled_at` it is a wallet contradicting itself.
+ */
+function walletSettlement(lookup: NwcLookupResult | null): WalletSettlement {
+  const state = lookup?.state;
+  const settledAt = lookup?.settled_at;
+  if (state === "settled") return "settled";
+  if (typeof settledAt !== "number" || !Number.isFinite(settledAt) || settledAt <= 0) return "unsettled";
+  return state === "pending" || state === "expired" || state === "failed" ? "contradictory" : "settled";
+}
+
+/** The preimage the wallet returned, if any. A claim, not proof: see `walletSettlement`. */
+function claimedPreimage(lookup: NwcLookupResult | null): string | null {
   if (typeof lookup?.preimage !== "string" || lookup.preimage.length === 0) {
     return null;
   }
@@ -71,7 +100,11 @@ function settledPreimage(lookup: NwcLookupResult | null): string | null {
  *   the NWC wallet, whatever the owner's destination is now, and never the SDK;
  * - minted by NWC while the owner is still on NWC: ask the wallet
  *   (`lookupInvoice`) and cache a preimage through the write-once path, but
- *   only a preimage whose sha256 is the invoice's payment hash counts;
+ *   only when the wallet reports the invoice settled (a positive `settled_at`
+ *   or a `state` of "settled") and the preimage's sha256 is the invoice's
+ *   payment hash. A preimage on its own is never proof: NIP-47 makes it
+ *   optional "if unpaid", and a wallet knows the preimage of an invoice it
+ *   created before anyone pays;
  * - minted by NWC after the owner moved to Spark: cached data only.
  *
  * The answer is `paid`, `pending` or `expired`. A lookup that fails or
@@ -150,7 +183,11 @@ export async function verifyInvoiceSettlement(input: {
     return unpaid("pending");
   }
 
-  const preimage = settledPreimage(lookup);
+  const settlement = walletSettlement(lookup);
+  // A wallet that contradicts itself proves nothing and rules nothing out: never paid, never expired.
+  if (settlement === "contradictory") return unpaid("pending");
+  // A preimage the wallet does not report settled is not proof, however well it hashes: the invoice's own clock decides.
+  const preimage = settlement === "settled" ? claimedPreimage(lookup) : null;
   if (!preimage) return byExpiry();
   if (!preimageMatchesPaymentHash(preimage, invoice.paymentHash)) {
     input.onPreimageMismatch?.(invoice);
