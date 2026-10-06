@@ -96,10 +96,10 @@ credential currently on the user row:
 |---------|-------|
 | Already settled | Cached preimage, no lookup. |
 | Minted by Spark | The stored preimage first. When the webhook has not settled it, one lookup in the SSP list settles it if the SSP proves the payment ([Reconciling a lost webhook](#reconciling-a-lost-webhook)). Never the NWC wallet, whatever the owner's destination is now, and never the SDK. |
-| Minted by NWC, owner still on NWC | One NWC `lookupInvoice` with the current secret; a preimage is cached through the write-once path, but only when its SHA-256 is the payment hash. |
+| Minted by NWC, owner still on NWC | One NWC `lookupInvoice` with the current secret. A preimage is cached through the write-once path only when the wallet also reports the invoice settled (a positive `settled_at` or a `state` of `settled`) and its SHA-256 is the payment hash. A preimage alone is not proof: NIP-47 makes it optional "if unpaid", and the wallet knows it before anyone pays. Without a settlement the invoice's own expiry decides between `pending` and `expired`. |
 | Minted by NWC, owner now on Spark | Cached data only. |
 
-The same rule guards the NWC `payment_received` notification: a preimage whose
+The same hash rule guards the NWC `payment_received` notification: a preimage whose
 SHA-256 is not the notification's payment hash settles nothing and publishes no
 zap. Either way Lite logs `nwc_preimage_mismatch` (warn, with the payment hash,
 never the preimage).
@@ -118,7 +118,7 @@ answers for an invoice it minted:
 | `payment_status` | Meaning |
 |------------------|---------|
 | `paid` | `settled` is `true`: a proven preimage is stored. |
-| `pending` | Not paid yet, **or Lite could not learn the state**: the wallet is unreachable, the lookup failed, or the wallet answered with a preimage that does not hash to the payment hash. Never "not paid", and never an HTTP error. |
+| `pending` | Not paid yet, **or Lite could not learn the state**: the wallet is unreachable, the lookup failed, or the wallet reported the invoice settled with a preimage that does not hash to the payment hash. Never "not paid", and never an HTTP error. |
 | `expired` | The invoice's own expiry has passed and nothing proves a payment. |
 
 The expiry is read from the stored BOLT11 (its timestamp plus its `x` field, or
@@ -268,7 +268,7 @@ log events (the `event` field):
 | `spark_reconcile_failed` | warn | The SSP lookup could not finish (`errorName`, plus `kind` and `http_status` for an SSP error). At most one a minute; `suppressed` counts those held back. |
 | `spark_reconcile_hash_mismatch` | warn | The SSP record carried a preimage that hashes to another invoice. Nothing was settled. |
 | `spark_settlement_missing` | warn | Verify saw a Spark invoice unsettled more than 5 minutes after creation, and Lite could not ask the SSP or the SSP could not answer. Once per payment hash per process, at most 1,000 hashes tracked. |
-| `nwc_preimage_mismatch` | warn | An NWC lookup or notification carried a preimage that does not hash to the payment hash. |
+| `nwc_preimage_mismatch` | warn | An NWC lookup that reported the invoice settled, or a notification, carried a preimage that does not hash to the payment hash. |
 
 The webhook rows above also appear with `source: "ssp_list"` when the SSP list,
 not the webhook, was the source. No log entry holds a preimage, the HMAC secret,
