@@ -602,6 +602,24 @@ Deno.test("recover returns the full body for a bound key and 404 for unbound or 
   expect({ status: missing.res.status, json: missing.json }).toEqual({ status: 404, json: "user not found" });
 });
 
+Deno.test("available is false for a reserved name and does not ask the repository", async () => {
+  const built = build({
+    state: {
+      byName: () => null,
+      intent: () => null,
+    },
+  });
+  for (const username of ["hello", "hel.lo", "zuricata", "admin", "mendoza", "mytravelsats", "ab".repeat(32)]) {
+    const { res, json } = await send(built, fixture("available", { username }));
+    expect({ username, status: res.status, json }).toEqual({
+      username,
+      status: 200,
+      json: { available: false },
+    });
+  }
+  expect(built.calls).toEqual([]);
+});
+
 Deno.test("available follows the name-and-intent matrix", async () => {
   const intentFor = (sparkPubkey: string) => () => ({ nostrPubkey: "bb".repeat(32), sparkPubkey });
   const matrix: Array<{ name: string; state: RepoState; username?: string; expected: boolean }> = [

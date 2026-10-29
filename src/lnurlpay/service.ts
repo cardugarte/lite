@@ -1,4 +1,5 @@
 import type { RegisterResult, StatementClaim, UserRow } from "../db/db.ts";
+import { reservedReason } from "../db/reservedUsernames.ts";
 import { claimExpiresAt, statementHash } from "./verify.ts";
 
 /** What the management service needs from the database. `DB` satisfies it structurally. */
@@ -104,6 +105,9 @@ export function createLnurlpayService(deps: LnurlpayDeps) {
      * bound to this key) and no active intent names another key.
      */
     async available(input: { pubkey: string; username: string }): Promise<Reply> {
+      if (reservedReason(input.username)) {
+        return { status: 200, body: { available: false } };
+      }
       const row = await repo.findUserByUsername(input.username);
       const nameFree = !row || (row.destination === "spark" && row.sparkIdentityPubkey === input.pubkey);
       const intent = await repo.findActiveBindingIntent(input.username, now());

@@ -950,6 +950,99 @@ Deno.test("DELETE /users needs the secret and then the npub header", async () =>
   });
 });
 
+Deno.test("POST /users rejects a reserved or too-short name and does not create a row", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, rows } = userDb();
+    const cases = [
+      { username: "ab", status: 400, reason: "invalid username" },
+      { username: "a", status: 400, reason: "invalid username" },
+      { username: "admin", status: 409, reason: "not available" },
+      { username: "  Hello ", status: 409, reason: "not available" },
+      { username: "hel.lo", status: 409, reason: "not available" },
+      { username: "zuricata", status: 409, reason: "not available" },
+      { username: "zu_ricata", status: 409, reason: "not available" },
+      { username: "mendoza", status: 409, reason: "not available" },
+      { username: "travelsats", status: 409, reason: "not available" },
+      { username: "mytravelsats", status: 409, reason: "not available" },
+      { username: "admin2", status: 409, reason: "not available" },
+      { username: "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", status: 409, reason: "not available" },
+      { username: "ab".repeat(32), status: 409, reason: "not available" },
+    ];
+    for (const item of cases) {
+      const { res, pool } = await callUsers(db, "POST", "/", secretHeaders(), nwcBody(item.username));
+      expect({ username: item.username, status: res.status, body: await res.json() }).toEqual({
+        username: item.username,
+        status: item.status,
+        body: { status: "ERROR", reason: item.reason },
+      });
+      expect(pool.subscribed).toEqual([]);
+      expect(item.reason.includes("reserved")).toEqual(false);
+      expect(item.reason.includes("taken")).toEqual(false);
+    }
+    expect(rows).toEqual([]);
+  });
+});
+
+Deno.test("POST /users still registers an ordinary name", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, rows } = userDb();
+    const { res } = await callUsers(db, "POST", "/", secretHeaders(), nwcBody("alice"));
+    expect(res.status).toEqual(200);
+    expect(rows.map((row) => row.username)).toEqual(["alice"]);
+  });
+});
+
+Deno.test("POST /users pads a generated username only when it is shorter than 3 characters", async () => {
+  await withSecret(SECRET, async () => {
+    const original = Math.random;
+    try {
+      Math.random = () => 0;
+      const zero = userDb();
+      const short = await callUsers(zero.db, "POST", "/", secretHeaders(), {
+        connectionSecret: NWC_URL,
+        nostrPubkey: NOSTR,
+      });
+      expect(short.res.status).toEqual(200);
+      expect(zero.rows.map((row) => row.username)).toEqual(["000"]);
+
+      Math.random = () => 0.5;
+      const mid = userDb();
+      const full = await callUsers(mid.db, "POST", "/", secretHeaders(), {
+        connectionSecret: NWC_URL,
+        nostrPubkey: NOSTR,
+      });
+      expect(full.res.status).toEqual(200);
+      expect(mid.rows.map((row) => row.username)).toEqual(["50000000000"]);
+    } finally {
+      Math.random = original;
+    }
+  });
+});
+
+Deno.test("POST /users/binding-intents rejects a reserved name and creates no intent", async () => {
+  await withSecret(SECRET, async () => {
+    const { db, calls } = intentRepo();
+    const cases = [
+      { username: "ab", status: 400, reason: "invalid username" },
+      { username: "admin", status: 409, reason: "not available" },
+      { username: "HELLO", status: 409, reason: "not available" },
+      { username: "zuricata", status: 409, reason: "not available" },
+      { username: "bariloche", status: 409, reason: "not available" },
+      { username: "support-desk", status: 409, reason: "not available" },
+      { username: "nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", status: 409, reason: "not available" },
+    ];
+    for (const item of cases) {
+      const { res } = await callUsers(db, "POST", "/binding-intents", assertedHeaders(), intentBody({ username: item.username }));
+      expect({ username: item.username, status: res.status, body: await res.json() }).toEqual({
+        username: item.username,
+        status: item.status,
+        body: { status: "ERROR", reason: item.reason },
+      });
+    }
+    expect(calls).toEqual([]);
+  });
+});
+
 Deno.test("POST /users answers 400 invalid request for non-object bodies and a non-string username", async () => {
   await withSecret(SECRET, async () => {
     const { db, rows } = userDb();
