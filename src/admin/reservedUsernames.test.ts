@@ -71,6 +71,32 @@ function auth(extra: Record<string, string> = {}) {
   return { Authorization: `Bearer ${TOKEN}`, ...extra };
 }
 
+Deno.test("PUT assignment accepts any valid pubkey and does not look up the assignee", async () => {
+  await withToken(async () => {
+    const stranger = "cd".repeat(32);
+    const lookedUp: string[] = [];
+    const { db } = store([{ name: "sanmartin", category: "assignable", match: "exact", assignedNostrPubkey: null }]);
+    (db as unknown as { findUserByNostrPubkey: () => Promise<never> }).findUserByNostrPubkey = async () => {
+      lookedUp.push("user");
+      throw new Error("eligibility lookup");
+    };
+    const app = createAdminReservedApp(db);
+    const res = await app.request("/sanmartin/assignment?match=exact", {
+      method: "PUT",
+      headers: { ...auth(), "Content-Type": "application/json" },
+      body: JSON.stringify({ nostr_pubkey: stranger.toUpperCase() }),
+    });
+    expect(res.status).toEqual(200);
+    expect(await res.json()).toEqual({
+      name: "sanmartin",
+      category: "assignable",
+      match: "exact",
+      assigned_nostr_pubkey: stranger,
+    });
+    expect(lookedUp).toEqual([]);
+  });
+});
+
 Deno.test("admin reserved-username routes reject anonymous callers", async () => {
   await withToken(async () => {
     const { db } = store();

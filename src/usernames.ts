@@ -4,16 +4,28 @@ import type { DB } from "./db/db.ts";
 import { isKeyLikeUsername } from "./db/reservedUsernames.ts";
 import { normalizeUsername, usernameProblem } from "./db/userValues.ts";
 import { isValid32ByteHex } from "./utils.ts";
+import { availabilityClientIp, availabilityRateConfig, createSlidingWindowLimiter } from "./usernames/rateLimit.ts";
 
 /**
  * Public availability. False for an invalid name, a taken name, a hard
  * reservation, or an assignable name not assigned to `pubkey`. The body is
- * only `{ available }`.
+ * only `{ available }`. Each client IP gets the PWA `user_profile` budget.
  */
-export function createUsernamesApp(db: DB, now: () => Date = () => new Date()) {
+export function createUsernamesApp(
+  db: DB,
+  now: () => Date = () => new Date(),
+  rate: { limit: number; windowMs: number } = availabilityRateConfig(),
+) {
   const hono = new Hono();
+  const { limit, windowMs } = rate;
+  const limiter = createSlidingWindowLimiter(limit, windowMs, () => now().getTime());
 
   hono.get("/:username/availability", async (c) => {
+    const decision = limiter.take(availabilityClientIp(c.req.raw.headers));
+    if (!decision.allowed) {
+      c.header("Retry-After", String(decision.retryAfterSeconds));
+      return c.json(errorEnvelope("too many requests"), 429);
+    }
     const rawPubkey = c.req.query("pubkey");
     if (rawPubkey !== undefined && !isValid32ByteHex(rawPubkey)) {
       return c.json(errorEnvelope("invalid pubkey"), 400);

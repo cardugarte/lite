@@ -164,7 +164,9 @@ Names only; set secrets in the environment, never in the repository. Copy
 | `DATABASE_URL` | yes | Postgres connection string. Migrations run at startup. |
 | `ENCRYPTION_KEY` | yes | Key that encrypts NWC connection secrets in the database (`deno task db:generate:key`). |
 | `TRAVELSATS_REGISTRATION_SECRET` | yes | Authorizes `/users` writes. Same value as the app's. Unset or blank answers `503`. Generate with `openssl rand -hex 32`. |
-| `LITE_ADMIN_TOKEN` | admin | Authorizes `/admin/reserved-usernames`. Compared in constant time to `Authorization: Bearer`. Unset or blank answers `401`. The PWA checks that a provider is verified before it calls assign. |
+| `LITE_ADMIN_TOKEN` | admin | Authorizes `/admin/reserved-usernames`. Compared in constant time to `Authorization: Bearer`. Unset or blank answers `401`. Any assignable name can be assigned to any 64-hex pubkey. |
+| `USERNAME_AVAILABILITY_RATE_LIMIT` | no | Max `GET /usernames/:username/availability` requests per IP. Default 50, the PWA `user_profile` tier. |
+| `USERNAME_AVAILABILITY_RATE_WINDOW_SECONDS` | no | Sliding window for that limit. Default 60. |
 | `APP_ORIGINS` | dev only | Comma-separated browser origins allowed on `/lnurlpay/*`. Dev: `https://dev.travelsats.ar`. Unset (prod): the `BASE_URL` origin. |
 | `SPARK_WEBHOOK_URL` | prod | Absolute URL registered with the minter webhook. Default `${BASE_URL}/spark/webhook`. Set it explicitly in prod, where `BASE_URL` is the app and not Lite's own origin (Fly origin plus `/spark/webhook`). Compared as an exact string. |
 | `SPARK_WEBHOOK_SECRET` | with minter | HMAC secret registered with the minter webhook. |
@@ -188,7 +190,8 @@ CORS is mounted per route prefix, not globally:
 
 | Prefix | CORS |
 |--------|------|
-| `/.well-known/lnurlp/*`, `/lnurlp/*`, `/.well-known/nostr.json`, `/usernames/*` | Any origin (payers' wallets and the app). No in-process rate limit, same as the other public GETs. |
+| `/.well-known/lnurlp/*`, `/lnurlp/*`, `/.well-known/nostr.json` | Any origin (payers' wallets). No in-process rate limit. |
+| `/usernames/*` | Any origin. `GET /:username/availability` is 50 requests per 60 seconds per IP (`Fly-Client-IP`, else the last `X-Forwarded-For` hop). Over the limit: `429` and `Retry-After`. |
 | `/admin/reserved-usernames` | None. `Authorization: Bearer` plus `LITE_ADMIN_TOKEN`. |
 | `/lnurlpay/*` | Only `APP_ORIGINS`, no credentials, preflight cached 600 seconds. Mounted **before** the 4 KiB body cap, so a preflight is answered first and a `413` still carries the allow-origin header. Writes allow `Content-Type, Authorization, User-Agent`; the metadata route also allows `X-Breez-Signature` and `X-Breez-Timestamp` (their values are never read). |
 | `/users/*`, `/spark/webhook` | None. |

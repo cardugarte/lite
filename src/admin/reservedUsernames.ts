@@ -122,6 +122,7 @@ export function createAdminReservedApp(db: DB) {
     if (typeof pubkey !== "string" || !isValid32ByteHex(pubkey)) {
       return c.json(errorEnvelope("invalid pubkey"), 400);
     }
+    // Any 64-hex pubkey. Lite does not check club, role, or provider verification.
     const result = await db.assignReservedUsername(
       normalizeReservedName(c.req.param("name")),
       match.match,
