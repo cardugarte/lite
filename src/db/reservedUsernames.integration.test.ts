@@ -5,6 +5,7 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "npm:postgres@3.4.5";
 import { encrypt } from "./aesgcm.ts";
 import { DB } from "./db.ts";
+import { createUsernamesApp } from "../usernames.ts";
 
 const databaseUrl = Deno.env.get("LITE_TEST_DATABASE_URL")?.trim() || "";
 
@@ -216,6 +217,49 @@ Deno.test({
         expect(page.total).toEqual(1);
         expect(page.rows[0].name).toEqual("mendoza");
         expect(page.rows[0].assignedNostrPubkey).toEqual(MENDOZA);
+      } finally {
+        await db.close();
+      }
+    });
+  },
+});
+
+Deno.test({
+  name: "mendoza, sanmartin, and bariloche_ availability follow the assignable seed",
+  ignore: !databaseUrl,
+  async fn() {
+    await withDatabase(async (_sql, url) => {
+      await applyNamed(_sql, [...BEFORE, RESERVED]);
+      const { DB: Repository } = await import("./db.ts");
+      const db = new Repository(url);
+      const app = createUsernamesApp(db, () => new Date("2026-03-01T12:00:00.000Z"));
+      const ask = async (path: string) => {
+        const res = await app.request(path);
+        expect(res.status).toEqual(200);
+        return await res.json();
+      };
+      try {
+        expect(await ask("/mendoza/availability")).toEqual({ available: false });
+        expect(await ask(`/mendoza/availability?pubkey=${MENDOZA}`)).toEqual({ available: false });
+        expect(await ask("/sanmartin/availability")).toEqual({ available: false });
+        expect(await ask(`/sanmartin/availability?pubkey=${OTHER}`)).toEqual({ available: false });
+        expect(await ask("/bariloche_/availability")).toEqual({ available: false });
+        expect((await db.assignReservedUsername("mendoza", "exact", MENDOZA)).kind).toEqual("assigned");
+        expect((await db.assignReservedUsername("sanmartin", "exact", OTHER)).kind).toEqual("assigned");
+        expect(await ask(`/mendoza/availability?pubkey=${MENDOZA}`)).toEqual({ available: true });
+        expect(await ask(`/mendoza/availability?pubkey=${OTHER}`)).toEqual({ available: false });
+        expect(await ask(`/sanmartin/availability?pubkey=${OTHER}`)).toEqual({ available: true });
+        expect(await ask("/sanmartin/availability")).toEqual({ available: false });
+        expect(await ask("/bariloche_/availability")).toEqual({ available: false });
+        const exact = await _sql<{ name: string; category: string }[]>`
+          select name, category from reserved_usernames where match = 'exact'
+        `;
+        const names = exact.map((row) => row.name);
+        expect(new Set(names).size).toEqual(names.length);
+        expect(exact.find((row) => row.name === "sanmartin")?.category).toEqual("assignable");
+        expect(exact.find((row) => row.name === "mendoza")?.category).toEqual("assignable");
+        expect(exact.find((row) => row.name === "hello")?.category).toEqual("hard");
+        expect(exact.find((row) => row.name === "zuricata")?.category).toEqual("hard");
       } finally {
         await db.close();
       }
