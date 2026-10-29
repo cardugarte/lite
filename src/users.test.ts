@@ -42,7 +42,10 @@ type StoredUser = {
   connectionSecret: string;
 };
 
-function userDb(mode: "ok" | "unique" | "boom" | "race" = "ok") {
+function userDb(
+  mode: "ok" | "unique" | "boom" | "race" = "ok",
+  reserved: (name: string, pubkey: string | null) => boolean = () => false,
+) {
   const rows: StoredUser[] = [];
   let chain: Promise<void> = Promise.resolve();
   const db = {
@@ -80,6 +83,7 @@ function userDb(mode: "ok" | "unique" | "boom" | "race" = "ok") {
       chain = run.then(() => {}, () => {});
       return run;
     },
+    isReservedUsername: async (name: string, pubkey: string | null) => reserved(name, pubkey),
   } as unknown as DB;
   return { db, rows };
 }
@@ -572,6 +576,7 @@ Deno.test("POST /users maps every repository conflict to its status and text", a
     for (const item of cases) {
       const db = {
         createUser: async () => ({ kind: "conflict", reason: item.reason }),
+        isReservedUsername: async () => false,
       } as unknown as DB;
       const { res, pool } = await callUsers(db, "POST", "/", secretHeaders(), nwcBody());
       expect(res.status).toEqual(409);
@@ -591,6 +596,7 @@ Deno.test("POST /users answers the first conflict in table order when several ap
         if (state.foreignIntent) return { kind: "conflict", reason: "name_in_progress" };
         return { kind: "created", user: createdUser(1, "alice") };
       },
+      isReservedUsername: async () => false,
     } as unknown as DB;
     const reasons: string[] = [];
     for (const step of ["usernameTaken", "accountExists", "foreignIntent"] as const) {
@@ -616,6 +622,7 @@ Deno.test("POST /users hands the repository a lowercase account, a lowercase nam
         seen.push(input);
         return { kind: "created", user: createdUser(4, "alice") };
       },
+      isReservedUsername: async () => false,
     } as unknown as DB;
     const { res, pool } = await callUsers(
       db,
@@ -637,7 +644,10 @@ Deno.test("POST /users hands the repository a lowercase account, a lowercase nam
 
 // L7.2: POST /users/binding-intents -----------------------------------------
 
-function intentRepo(result: unknown = { kind: "ok", expiresAt: new Date("2026-03-01T12:10:00.000Z") }) {
+function intentRepo(
+  result: unknown = { kind: "ok", expiresAt: new Date("2026-03-01T12:10:00.000Z") },
+  reserved: (name: string, pubkey: string | null) => boolean = () => false,
+) {
   const calls: Array<Record<string, unknown>> = [];
   const db = {
     createBindingIntent: async (input: Record<string, unknown>) => {
@@ -645,6 +655,7 @@ function intentRepo(result: unknown = { kind: "ok", expiresAt: new Date("2026-03
       if (result instanceof Error) throw result;
       return result;
     },
+    isReservedUsername: async (name: string, pubkey: string | null) => reserved(name, pubkey),
   } as unknown as DB;
   return { db, calls };
 }
@@ -950,9 +961,59 @@ Deno.test("DELETE /users needs the secret and then the npub header", async () =>
   });
 });
 
+Deno.test("POST /users takes reservation from the database for this nostr pubkey", async () => {
+  await withSecret(SECRET, async () => {
+    const seen: Array<{ name: string; pubkey: string | null }> = [];
+    const db = {
+      isReservedUsername: async (name: string, pubkey: string | null) => {
+        seen.push({ name, pubkey });
+        return name === "plainname";
+      },
+      createUser: async (input: { username: string }) => ({
+        kind: "created",
+        user: createdUser(3, input.username),
+      }),
+    } as unknown as DB;
+    const blocked = await callUsers(db, "POST", "/", secretHeaders(), nwcBody("plainname"));
+    expect(blocked.res.status).toEqual(409);
+    expect(await blocked.res.json()).toEqual({ status: "ERROR", reason: "not available" });
+    expect(blocked.pool.subscribed).toEqual([]);
+
+    const allowed = await callUsers(db, "POST", "/", secretHeaders(), nwcBody("admin"));
+    expect(allowed.res.status).toEqual(200);
+    expect(seen).toEqual([
+      { name: "plainname", pubkey: NOSTR },
+      { name: "admin", pubkey: NOSTR },
+    ]);
+  });
+});
+
+Deno.test("POST /users/binding-intents takes reservation from the database for the asserted pubkey", async () => {
+  await withSecret(SECRET, async () => {
+    const seen: Array<{ name: string; pubkey: string | null }> = [];
+    const { db, calls } = intentRepo();
+    (db as unknown as { isReservedUsername: (name: string, pubkey: string | null) => Promise<boolean> }).isReservedUsername =
+      async (name: string, pubkey: string | null) => {
+        seen.push({ name, pubkey });
+        return normalizeReservedProbe(name) === "hello";
+      };
+    const blocked = await callUsers(db, "POST", "/binding-intents", assertedHeaders(), intentBody({ username: "Hel.Lo" }));
+    expect(blocked.res.status).toEqual(409);
+    expect(await blocked.res.json()).toEqual({ status: "ERROR", reason: "not available" });
+    const allowed = await callUsers(db, "POST", "/binding-intents", assertedHeaders(), intentBody({ username: "alice" }));
+    expect(allowed.res.status).toEqual(200);
+    expect(seen.map((row) => row.pubkey)).toEqual([NOSTR, NOSTR]);
+    expect(calls.map((row) => row.username)).toEqual(["alice"]);
+  });
+});
+
+function normalizeReservedProbe(name: string): string {
+  return name.trim().toLowerCase().replace(/[.\-_]/g, "");
+}
+
 Deno.test("POST /users rejects a reserved or too-short name and does not create a row", async () => {
   await withSecret(SECRET, async () => {
-    const { db, rows } = userDb();
+    const { db, rows } = userDb("ok", () => true);
     const cases = [
       { username: "ab", status: 400, reason: "invalid username" },
       { username: "a", status: 400, reason: "invalid username" },
@@ -1021,7 +1082,7 @@ Deno.test("POST /users pads a generated username only when it is shorter than 3 
 
 Deno.test("POST /users/binding-intents rejects a reserved name and creates no intent", async () => {
   await withSecret(SECRET, async () => {
-    const { db, calls } = intentRepo();
+    const { db, calls } = intentRepo(undefined, () => true);
     const cases = [
       { username: "ab", status: 400, reason: "invalid username" },
       { username: "admin", status: 409, reason: "not available" },

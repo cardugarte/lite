@@ -185,6 +185,45 @@ Deno.test({
 });
 
 Deno.test({
+  name: "reserved_usernames is the registration check, including an assignment for one pubkey",
+  ignore: !databaseUrl,
+  async fn() {
+    await withDatabase(async (sql, url) => {
+      await applyNamed(sql, [...BEFORE, RESERVED]);
+      const { DB: Repository } = await import("./db.ts");
+      const db = new Repository(url);
+      try {
+        expect(await db.isReservedUsername("admin", null)).toEqual(true);
+        expect(await db.isReservedUsername("Ad.Min", null)).toEqual(true);
+        expect(await db.isReservedUsername("admin2", null)).toEqual(true);
+        expect(await db.isReservedUsername("xadmin", null)).toEqual(false);
+        expect(await db.isReservedUsername("mytravelsats", null)).toEqual(true);
+        expect(await db.isReservedUsername("andes", null)).toEqual(false);
+        expect(await db.isReservedUsername("mendoza", null)).toEqual(true);
+        expect(await db.isReservedUsername("mendoza", MENDOZA)).toEqual(true);
+        const assigned = await db.assignReservedUsername("mendoza", "exact", MENDOZA);
+        expect(assigned.kind).toEqual("assigned");
+        expect(await db.isReservedUsername("mendoza", MENDOZA)).toEqual(false);
+        expect(await db.isReservedUsername("mendoza", OTHER)).toEqual(true);
+        expect(await db.isReservedUsername("admin", MENDOZA)).toEqual(true);
+        await sql`
+          insert into binding_intents (username, nostr_pubkey, spark_pubkey, expires_at)
+          values ('mendoza', ${MENDOZA}, ${SPARK}, ${new Date("2026-03-01T12:10:00.000Z")})
+        `;
+        expect(await db.isReservedUsername("mendoza", SPARK, new Date("2026-03-01T12:00:00.000Z"))).toEqual(false);
+        expect(await db.isReservedUsername("mendoza", SPARK, new Date("2026-03-01T13:00:00.000Z"))).toEqual(true);
+        const page = await db.listReservedUsernames({ q: "men", category: "assignable", match: "exact", limit: 10, offset: 0 });
+        expect(page.total).toEqual(1);
+        expect(page.rows[0].name).toEqual("mendoza");
+        expect(page.rows[0].assignedNostrPubkey).toEqual(MENDOZA);
+      } finally {
+        await db.close();
+      }
+    });
+  },
+});
+
+Deno.test({
   name: "drizzle migrate applies 0006 and seeds reserved_usernames",
   ignore: !databaseUrl,
   async fn() {

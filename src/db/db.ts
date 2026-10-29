@@ -6,6 +6,7 @@ import postgres from "npm:postgres@3.4.5";
 import { and, eq, gt, isNull, lt, lte, ne, sql } from "drizzle-orm";
 import { DATABASE_URL } from "../constants.ts";
 import { decrypt } from "./aesgcm.ts";
+import { normalizeReservedName } from "./reservedUsernames.ts";
 import * as schema from "./schema.ts";
 import { bindingIntents, invoices, signedStatements, users } from "./schema.ts";
 
@@ -23,6 +24,13 @@ export const CONFLICT = {
 export type Conflict = (typeof CONFLICT)[keyof typeof CONFLICT];
 
 export const INTENT_TTL_SECS = 600;
+
+export type ReservedUsernameRecord = {
+  name: string;
+  category: "hard" | "assignable";
+  match: "exact" | "prefix" | "contains";
+  assignedNostrPubkey: string | null;
+};
 
 export interface UserRow {
   id: number;
@@ -135,6 +143,158 @@ export class DB {
       .where(and(eq(bindingIntents.username, username), gt(bindingIntents.expiresAt, now)))
       .limit(1);
     return intent ?? null;
+  }
+
+  /**
+   * One query. Exact, prefix, and contains rules on the normalized name.
+   * An assignable row assigned to `pubkey` — or to the nostr account that
+   * owns that spark key, or that holds an active intent for it — is not a block.
+   */
+  async isReservedUsername(name: string, pubkey: string | null, now: Date = new Date()): Promise<boolean> {
+    const normalized = normalizeReservedName(name);
+    if (!normalized) return false;
+    const key = pubkey ?? "";
+    const at = now.toISOString();
+    const rows = await this._client<{ blocked: number }[]>`
+      select 1 as blocked
+      from reserved_usernames r
+      where (
+        (r.match = 'exact' and r.name = ${normalized})
+        or (r.match = 'prefix' and left(${normalized}, char_length(r.name)) = r.name)
+        or (r.match = 'contains' and strpos(${normalized}, r.name) > 0)
+      )
+      and not (
+        r.category = 'assignable'
+        and r.assigned_nostr_pubkey is not null
+        and ${key} <> ''
+        and (
+          r.assigned_nostr_pubkey = ${key}
+          or exists (
+            select 1 from users u
+            where u.nostr_pubkey = r.assigned_nostr_pubkey
+              and u.spark_identity_pubkey = ${key}
+          )
+          or exists (
+            select 1 from binding_intents b
+            where b.nostr_pubkey = r.assigned_nostr_pubkey
+              and b.spark_pubkey = ${key}
+              and b.expires_at > ${at}::timestamptz
+          )
+        )
+      )
+      limit 1
+    `;
+    return rows.length > 0;
+  }
+
+  async listReservedUsernames(query: {
+    q: string;
+    category: string | null;
+    match: string | null;
+    limit: number;
+    offset: number;
+  }): Promise<{ rows: ReservedUsernameRecord[]; total: number }> {
+    const category = query.category ?? "";
+    const match = query.match ?? "";
+    const rows = await this._client<Array<ReservedUsernameRecord & { total: string }>>`
+      select
+        name,
+        category,
+        match,
+        assigned_nostr_pubkey as "assignedNostrPubkey",
+        count(*) over() as total
+      from reserved_usernames
+      where (${query.q} = '' or strpos(name, ${query.q}) > 0)
+        and (${category} = '' or category = ${category})
+        and (${match} = '' or match = ${match})
+      order by name, match
+      limit ${query.limit} offset ${query.offset}
+    `;
+    return {
+      rows: rows.map(({ total: _total, ...row }) => row),
+      total: rows.length === 0 ? await this.countReservedUsernames(query) : Number(rows[0].total),
+    };
+  }
+
+  private async countReservedUsernames(query: { q: string; category: string | null; match: string | null }): Promise<number> {
+    const category = query.category ?? "";
+    const match = query.match ?? "";
+    const [row] = await this._client<{ total: string }[]>`
+      select count(*)::text as total
+      from reserved_usernames
+      where (${query.q} = '' or strpos(name, ${query.q}) > 0)
+        and (${category} = '' or category = ${category})
+        and (${match} = '' or match = ${match})
+    `;
+    return Number(row?.total ?? 0);
+  }
+
+  async insertReservedUsername(input: {
+    name: string;
+    category: "hard" | "assignable";
+    match: "exact" | "prefix" | "contains";
+  }): Promise<{ kind: "created"; row: ReservedUsernameRecord } | { kind: "conflict" }> {
+    try {
+      const [row] = await this._client<ReservedUsernameRecord[]>`
+        insert into reserved_usernames (name, category, match)
+        values (${input.name}, ${input.category}, ${input.match})
+        returning name, category, match, assigned_nostr_pubkey as "assignedNostrPubkey"
+      `;
+      return { kind: "created", row };
+    } catch (error) {
+      if (error instanceof postgres.PostgresError && error.code === "23505") return { kind: "conflict" };
+      throw error;
+    }
+  }
+
+  async deleteReservedUsername(name: string, match: string): Promise<number> {
+    const rows = await this._client<{ name: string }[]>`
+      delete from reserved_usernames where name = ${name} and match = ${match} returning name
+    `;
+    return rows.length;
+  }
+
+  async updateReservedCategory(
+    name: string,
+    match: string,
+    category: "hard" | "assignable",
+  ): Promise<ReservedUsernameRecord | null> {
+    const [row] = await this._client<ReservedUsernameRecord[]>`
+      update reserved_usernames
+      set category = ${category},
+          assigned_nostr_pubkey = case when ${category} = 'hard' then null else assigned_nostr_pubkey end
+      where name = ${name} and match = ${match}
+      returning name, category, match, assigned_nostr_pubkey as "assignedNostrPubkey"
+    `;
+    return row ?? null;
+  }
+
+  async assignReservedUsername(
+    name: string,
+    match: string,
+    pubkey: string,
+  ): Promise<{ kind: "assigned"; row: ReservedUsernameRecord } | { kind: "not_found" } | { kind: "not_assignable" }> {
+    const [row] = await this._client<ReservedUsernameRecord[]>`
+      update reserved_usernames
+      set assigned_nostr_pubkey = ${pubkey}
+      where name = ${name} and match = ${match} and category = 'assignable'
+      returning name, category, match, assigned_nostr_pubkey as "assignedNostrPubkey"
+    `;
+    if (row) return { kind: "assigned", row };
+    const [existing] = await this._client<{ category: string }[]>`
+      select category from reserved_usernames where name = ${name} and match = ${match}
+    `;
+    return existing ? { kind: "not_assignable" } : { kind: "not_found" };
+  }
+
+  async clearReservedAssignment(name: string, match: string): Promise<ReservedUsernameRecord | null> {
+    const [row] = await this._client<ReservedUsernameRecord[]>`
+      update reserved_usernames
+      set assigned_nostr_pubkey = null
+      where name = ${name} and match = ${match}
+      returning name, category, match, assigned_nostr_pubkey as "assignedNostrPubkey"
+    `;
+    return row ?? null;
   }
 
   /**

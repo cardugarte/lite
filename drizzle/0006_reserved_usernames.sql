@@ -1,9 +1,8 @@
 -- Reserved Lightning addresses.
--- The seed is the same list as src/db/reservedUsernames.ts. The app checks
--- that file; these triggers are the database backstop. Existing rows are
--- left in place: the trigger skips an UPDATE that does not change username,
--- and the length/format checks skip the existing-row scan so a short legacy name does
--- not stop this migration.
+-- This seed is the initial contents of reserved_usernames. After it runs,
+-- the table is the source of truth. Triggers are the last line of defense.
+-- An UPDATE that does not change username is skipped. Length and format
+-- checks skip the existing-row scan so a legacy name does not stop this migration.
 CREATE TABLE IF NOT EXISTS "reserved_usernames" (
 	"name" text NOT NULL,
 	"category" text NOT NULL,

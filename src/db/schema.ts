@@ -1,9 +1,8 @@
 import { bigint, index, integer, jsonb, pgTable, primaryKey, serial, text, timestamp } from "drizzle-orm/pg-core";
 
 /**
- * Seeded from `reservedUsernames.ts`. The app does not read this at request
- * time; triggers do. `assigned_nostr_pubkey` is the admin-assignment slot
- * for an assignable destination.
+ * Source of truth for reserved names. Seeded by migration 0006; admin writes
+ * change it afterwards. `assigned_nostr_pubkey` is set only on assignable rows.
  */
 export const reservedUsernames = pgTable("reserved_usernames", {
   name: text("name").notNull(),

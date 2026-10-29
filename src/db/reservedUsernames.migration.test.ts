@@ -1,36 +1,7 @@
 import { expect } from "jsr:@std/expect";
-import { RESERVED_CONTAINS, RESERVED_LISTS, RESERVED_PREFIXES } from "./reservedUsernames.ts";
 
 const MIGRATION = new URL("../../drizzle/0006_reserved_usernames.sql", import.meta.url);
 const JOURNAL = new URL("../../drizzle/meta/_journal.json", import.meta.url);
-
-/** Rows the migration must seed, derived here from the data file. */
-function expectedSeed(): string[] {
-  const rows: string[] = [];
-  const seen = new Set<string>();
-  for (const [group, names] of Object.entries(RESERVED_LISTS)) {
-    const category = group === "assignable" ? "assignable" : "hard";
-    for (const name of names) {
-      const key = `${name}|${category}|exact`;
-      if (seen.has(`${name}|exact`)) {
-        const previous = rows.find((row) => row.startsWith(`${name}|`) && row.endsWith("|exact"));
-        if (previous !== key) throw new Error(`category clash for ${name}`);
-        continue;
-      }
-      seen.add(`${name}|exact`);
-      rows.push(key);
-    }
-  }
-  for (const name of RESERVED_PREFIXES) rows.push(`${name}|hard|prefix`);
-  for (const name of RESERVED_CONTAINS) rows.push(`${name}|hard|contains`);
-  return rows.sort();
-}
-
-function seededRows(sql: string): string[] {
-  return [...sql.matchAll(/\('([a-z0-9]+)', '(hard|assignable)', '(exact|prefix|contains)'\)/g)]
-    .map((match) => `${match[1]}|${match[2]}|${match[3]}`)
-    .sort();
-}
 
 async function migrationSql(): Promise<string> {
   try {
@@ -39,15 +10,6 @@ async function migrationSql(): Promise<string> {
     return "";
   }
 }
-
-Deno.test("the reserved_usernames seed matches the versioned data file", async () => {
-  const sql = await migrationSql();
-  expect(sql.length).toBeGreaterThan(0);
-  const seeded = seededRows(sql);
-  const expected = expectedSeed();
-  expect(seeded).toEqual(expected);
-  expect(new Set(seeded).size).toEqual(seeded.length);
-});
 
 Deno.test("the migration rejects reserved names in SQL and grandfathers existing rows", async () => {
   const sql = await migrationSql();

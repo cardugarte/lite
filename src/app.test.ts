@@ -20,6 +20,9 @@ function app() {
       destination: "spark",
       sparkIdentityPubkey: "02" + "ab".repeat(32),
     }),
+    isReservedUsername: async () => false,
+    findUserByUsername: async () => null,
+    findActiveBindingIntent: async () => null,
   } as unknown as DB;
   return buildApp({
     db,
@@ -39,7 +42,7 @@ function preflight(path: string) {
 }
 
 Deno.test("secret and webhook prefixes do not emit Access-Control-Allow-Origin", async () => {
-  for (const path of ["/users", "/users/binding-intents", "/users/nwc-bind", "/spark/webhook"]) {
+  for (const path of ["/users", "/users/binding-intents", "/users/nwc-bind", "/spark/webhook", "/admin/reserved-usernames"]) {
     const res = await preflight(path);
     expect({ path, allowOrigin: res.headers.get("Access-Control-Allow-Origin") }).toEqual({
       path,
@@ -53,6 +56,7 @@ Deno.test("public LNURL prefixes allow any origin", async () => {
     "/.well-known/lnurlp/alice",
     "/lnurlp/alice/callback?amount=1000",
     "/.well-known/nostr.json?name=alice",
+    "/usernames/alice/availability",
   ];
   for (const path of paths) {
     const res = await app().request(path, {
