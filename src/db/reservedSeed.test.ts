@@ -1,6 +1,4 @@
 import { expect } from "jsr:@std/expect";
-import { sha256 } from "npm:@noble/hashes@1.3.1/sha256";
-import { bytesToHex, utf8ToBytes } from "npm:@noble/hashes@1.3.1/utils";
 import { usernameProblem } from "./userValues.ts";
 
 /** Places and historical figures. Every one is assignable unless an existing hard row already owns the name. */
@@ -36,9 +34,6 @@ const FIGURES = [
 
 const ADDITIONS = [...PLACES, ...FIGURES];
 
-/** Hard exact names already in 0006 before this addition. They must not change category. */
-const HARD_EXACT_SHA256 = "59bbf49649f527c0dc0acb0a2cf6b6b5ae6c7d82c8868dd50cc6c7b6c50d6467";
-
 type Row = { name: string; category: "hard" | "assignable"; match: "exact" | "prefix" | "contains" };
 
 function seedRows(sql: string): Row[] {
@@ -49,7 +44,7 @@ function seedRows(sql: string): Row[] {
   }));
 }
 
-Deno.test("the 0006 seed keeps every new place and figure as assignable exact", async () => {
+Deno.test("the 0006 seed is entirely assignable, with no hard rows", async () => {
   const sql = await Deno.readTextFile(new URL("../../drizzle/0006_reserved_usernames.sql", import.meta.url));
   const rows = seedRows(sql);
   const exact = new Map<string, string>();
@@ -64,18 +59,17 @@ Deno.test("the 0006 seed keeps every new place and figure as assignable exact", 
     }
   }
 
-  const hardExact = [...exact.entries()].filter(([, category]) => category === "hard").map(([name]) => name).sort();
-  expect(bytesToHex(sha256(utf8ToBytes(hardExact.join("\n"))))).toEqual(HARD_EXACT_SHA256);
-  expect(rows.filter((row) => row.match === "prefix").map((row) => row.name).sort()).toEqual([
+  const prefixes = rows.filter((row) => row.match === "prefix");
+  expect(prefixes.map((row) => row.name).sort()).toEqual([
     "admin", "ayuda", "billing", "help", "mod", "official", "oficial", "security", "soporte", "staff",
     "support", "team", "travelsats", "zuricata",
   ]);
-  expect(rows.filter((row) => row.match === "contains").map((row) => row.name).sort()).toEqual([
-    "travelsats", "zuricata",
-  ]);
+  expect(prefixes.every((row) => row.category === "assignable")).toEqual(true);
+  const contains = rows.filter((row) => row.match === "contains");
+  expect(contains.map((row) => row.name).sort()).toEqual(["travelsats", "zuricata"]);
+  expect(contains.every((row) => row.category === "assignable")).toEqual(true);
 
   const dropped: string[] = [];
-  const keptHard: string[] = [];
   for (const name of ADDITIONS) {
     const problem = usernameProblem(name);
     if (problem) {
@@ -83,22 +77,13 @@ Deno.test("the 0006 seed keeps every new place and figure as assignable exact", 
       expect(exact.has(name)).toEqual(false);
       continue;
     }
-    if (hardExact.includes(name)) {
-      keptHard.push(name);
-      expect(exact.get(name)).toEqual("hard");
-      continue;
-    }
     expect(exact.get(name)).toEqual("assignable");
   }
   expect(dropped).toEqual([]);
-  expect(keptHard).toEqual([]);
-  for (const name of ["calafate", "chalten", "payunia", "hello", "zuricata"]) {
-    expect({ name, category: exact.get(name) }).toEqual({
-      name,
-      category: name === "hello" || name === "zuricata" ? "hard" : "assignable",
-    });
+  for (const name of ["admin", "api", "root", "travelsats", "hello", "zuricata", "calafate", "payunia"]) {
+    expect(exact.get(name)).toEqual("assignable");
   }
-  // 19 of the additions are already assignable exact rows. 151 are new. None replace a hard row.
-  expect(rows.filter((row) => row.category === "assignable").length).toEqual(173);
-  expect(rows.filter((row) => row.category === "hard").length).toEqual(358);
+  expect(rows.filter((row) => row.category === "hard").length).toEqual(0);
+  expect(rows.filter((row) => row.category === "assignable").length).toEqual(531);
+  expect(rows.filter((row) => row.match === "exact").length).toEqual(515);
 });

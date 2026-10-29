@@ -158,10 +158,22 @@ Deno.test({
         values ('bariloche', ${MENDOZA}, ${SPARK}, ${new Date("2026-03-01T12:10:00.000Z")})
       `;
 
-      await expect(sql`
+      await sql`
         update reserved_usernames
         set assigned_nostr_pubkey = ${HELLO}
         where name = 'admin' and match = 'exact'
+      `;
+      const [adminExact] = await sql<{ assigned_nostr_pubkey: string }[]>`
+        select assigned_nostr_pubkey from reserved_usernames where name = 'admin' and match = 'exact'
+      `;
+      expect(adminExact.assigned_nostr_pubkey).toEqual(HELLO);
+      await sql`
+        insert into reserved_usernames (name, category, match) values ('forever', 'hard', 'exact')
+      `;
+      await expect(sql`
+        update reserved_usernames
+        set assigned_nostr_pubkey = ${HELLO}
+        where name = 'forever' and match = 'exact'
       `).rejects.toThrow(/reserved_usernames_assignment|check constraint/i);
 
       await expect(sql`
@@ -207,13 +219,28 @@ Deno.test({
         expect(await db.isReservedUsername("mendoza", MENDOZA)).toEqual(false);
         expect(await db.isReservedUsername("mendoza", OTHER)).toEqual(true);
         expect(await db.isReservedUsername("admin", MENDOZA)).toEqual(true);
+        expect(await db.isReservedUsername("modzz", null)).toEqual(true);
+        expect(await db.isReservedUsername("modzz", MENDOZA)).toEqual(true);
+        expect((await db.assignReservedUsername("mod", "prefix", MENDOZA)).kind).toEqual("assigned");
+        expect(await db.isReservedUsername("modzz", MENDOZA)).toEqual(false);
+        expect(await db.isReservedUsername("modzz", OTHER)).toEqual(true);
+        expect(await db.isReservedUsername("mod", MENDOZA)).toEqual(true);
+        expect((await db.assignReservedUsername("mod", "exact", MENDOZA)).kind).toEqual("assigned");
+        expect(await db.isReservedUsername("mod", MENDOZA)).toEqual(false);
+        expect(await db.isReservedUsername("mod", OTHER)).toEqual(true);
+        expect(await db.isReservedUsername("xxtravelsatsyy", OTHER)).toEqual(true);
+        expect((await db.assignReservedUsername("travelsats", "contains", OTHER)).kind).toEqual("assigned");
+        expect(await db.isReservedUsername("xxtravelsatsyy", OTHER)).toEqual(false);
+        expect(await db.isReservedUsername("xxtravelsatsyy", MENDOZA)).toEqual(true);
+        expect(await db.isReservedUsername("travelsats", OTHER)).toEqual(true);
+        expect(await db.isReservedUsername("npub1qqqqqqqqqqqqq", MENDOZA)).toEqual(false);
         await sql`
           insert into binding_intents (username, nostr_pubkey, spark_pubkey, expires_at)
           values ('mendoza', ${MENDOZA}, ${SPARK}, ${new Date("2026-03-01T12:10:00.000Z")})
         `;
         expect(await db.isReservedUsername("mendoza", SPARK, new Date("2026-03-01T12:00:00.000Z"))).toEqual(false);
         expect(await db.isReservedUsername("mendoza", SPARK, new Date("2026-03-01T13:00:00.000Z"))).toEqual(true);
-        const page = await db.listReservedUsernames({ q: "men", category: "assignable", match: "exact", limit: 10, offset: 0 });
+        const page = await db.listReservedUsernames({ q: "mendoza", category: "assignable", match: "exact", limit: 10, offset: 0 });
         expect(page.total).toEqual(1);
         expect(page.rows[0].name).toEqual("mendoza");
         expect(page.rows[0].assignedNostrPubkey).toEqual(MENDOZA);
@@ -258,8 +285,8 @@ Deno.test({
         expect(new Set(names).size).toEqual(names.length);
         expect(exact.find((row) => row.name === "sanmartin")?.category).toEqual("assignable");
         expect(exact.find((row) => row.name === "mendoza")?.category).toEqual("assignable");
-        expect(exact.find((row) => row.name === "hello")?.category).toEqual("hard");
-        expect(exact.find((row) => row.name === "zuricata")?.category).toEqual("hard");
+        expect(exact.find((row) => row.name === "hello")?.category).toEqual("assignable");
+        expect(exact.find((row) => row.name === "zuricata")?.category).toEqual("assignable");
       } finally {
         await db.close();
       }
@@ -275,11 +302,15 @@ Deno.test({
       const db = drizzle(sql);
       await migrate(db, { migrationsFolder: "./drizzle" });
       const [count] = await sql<{ n: string }[]>`select count(*)::text as n from reserved_usernames`;
-      expect(Number(count.n)).toBeGreaterThan(300);
+      expect(Number(count.n)).toEqual(531);
+      const [hard] = await sql<{ n: string }[]>`
+        select count(*)::text as n from reserved_usernames where category = 'hard'
+      `;
+      expect(hard.n).toEqual("0");
       const [hello] = await sql<{ category: string; match: string }[]>`
         select category, match from reserved_usernames where name = 'hello' and match = 'exact'
       `;
-      expect(hello).toEqual({ category: "hard", match: "exact" });
+      expect(hello).toEqual({ category: "assignable", match: "exact" });
       const [mendoza] = await sql<{ category: string; assigned_nostr_pubkey: string | null }[]>`
         select category, assigned_nostr_pubkey from reserved_usernames
         where name = 'mendoza' and match = 'exact'
