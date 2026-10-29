@@ -13,6 +13,8 @@ import { NWCPool } from "./nwc/nwcPool.ts";
 import type { SparkMinter } from "./spark/minter.ts";
 import type { SparkReconciler } from "./spark/reconcile.ts";
 import { createSparkWebhookApp } from "./spark/webhook.ts";
+import { createAdminReservedApp } from "./admin/reservedUsernames.ts";
+import { createUsernamesApp } from "./usernames.ts";
 import { createUsersApp } from "./users.ts";
 import { createLnurlWellKnownApp, createNostrWellKnownApp } from "./well-known/index.ts";
 
@@ -44,6 +46,7 @@ export function buildApp(deps: AppDeps) {
   hono.use("/.well-known/lnurlp/*", publicCors);
   hono.use("/.well-known/nostr.json", publicCors);
   hono.use("/lnurlp/*", publicCors);
+  hono.use("/usernames/*", publicCors);
 
   // Order matters: CORS first, so a preflight is answered before any body
   // handling and a 413 to a listed origin still carries the allow-origin header.
@@ -74,7 +77,9 @@ export function buildApp(deps: AppDeps) {
       now: deps.now ?? (() => new Date()),
     }),
   );
-  hono.route("/users", createUsersApp(deps.db, deps.nwcPool));
+  hono.route("/users", createUsersApp(deps.db, deps.nwcPool, deps.now));
+  hono.route("/usernames", createUsernamesApp(deps.db, deps.now));
+  hono.route("/admin/reserved-usernames", createAdminReservedApp(deps.db));
   hono.route("/spark/webhook", createSparkWebhookApp(deps.db, deps.sparkWebhookSecret));
 
   hono.get("/ping", (c) => {

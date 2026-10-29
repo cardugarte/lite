@@ -43,6 +43,13 @@
       "when": 1790895997691,
       "tag": "0005_breez_minter_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793286166044,
+      "tag": "0006_reserved_usernames",
+      "breakpoints": true
     }
   ]
 }

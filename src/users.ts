@@ -5,6 +5,7 @@ import { errorEnvelope, readAssertedNostrPubkey, requireRegistrationSecret } fro
 import { LNURL_DOMAIN } from "./constants.ts";
 import { encrypt } from "./db/aesgcm.ts";
 import { DB } from "./db/db.ts";
+import { isKeyLikeUsername } from "./db/reservedUsernames.ts";
 import {
   normalizeUsername,
   parseNwcConnectionSecret,
@@ -44,6 +45,23 @@ function connectionSecretError(connectionSecret: string): string | null {
   } catch (error) {
     return error instanceof Error && error.message ? error.message : "invalid connection secret";
   }
+}
+
+/** Format problems stay "invalid username"; a reserved name is only "not available". */
+async function rejectUsername(
+  c: Context,
+  db: DB,
+  username: string,
+  pubkey: string,
+): Promise<Response | null> {
+  const problem = usernameProblem(username);
+  if (problem) {
+    return c.json(errorEnvelope(problem === "too_long" ? "username too long" : "invalid username"), 400);
+  }
+  if (isKeyLikeUsername(username) || await db.isReservedUsername(username, pubkey)) {
+    return c.json(errorEnvelope("not available"), 409);
+  }
+  return null;
 }
 
 function internalError(c: Context, message: string, error: unknown) {
@@ -113,8 +131,11 @@ export function createUsersApp(db: DB, nwcPool: NWCPool, now: () => Date = () =>
 
       // TODO: use haikunator
       const username = normalizeUsername(
-        createUserRequest.username || Math.floor(Math.random() * 100000000000).toString(),
+        createUserRequest.username ||
+          Math.floor(Math.random() * 100000000000).toString().padStart(3, "0"),
       );
+      const rejected = await rejectUsername(c, db, username, nostrPubkey.toLowerCase());
+      if (rejected) return rejected;
       const created = await db.createUser({
         npubHex: nostrPubkey.toLowerCase(),
         username,
@@ -148,10 +169,8 @@ export function createUsersApp(db: DB, nwcPool: NWCPool, now: () => Date = () =>
       return c.json(errorEnvelope("invalid username"), 400);
     }
     const username = normalizeUsername(rawUsername);
-    const problem = usernameProblem(username);
-    if (problem) {
-      return c.json(errorEnvelope(problem === "too_long" ? "username too long" : "invalid username"), 400);
-    }
+    const rejected = await rejectUsername(c, db, username, asserted.pubkey);
+    if (rejected) return rejected;
     if (typeof sparkPubkey !== "string" || !SPARK_PUBKEY_REGEX.test(sparkPubkey)) {
       return c.json(errorEnvelope("invalid sparkPubkey"), 400);
     }

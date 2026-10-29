@@ -63,31 +63,36 @@ type RepoState = {
   byKey?: (pubkey: string) => UserRow | null;
   byName?: (username: string) => UserRow | null;
   intent?: (username: string) => { nostrPubkey: string; sparkPubkey: string } | null;
+  reserved?: (name: string, pubkey: string) => boolean;
 };
 
 function makeRepo(state: RepoState = {}) {
   const calls: RepoCall[] = [];
-  const repo: LnurlpayRepository = {
-    registerSparkAddress: async (...args) => {
+  const repo = {
+    registerSparkAddress: async (...args: unknown[]) => {
       calls.push({ method: "registerSparkAddress", args });
       const result = state.register ?? { kind: "created", user: userRow(), previous: null };
       if (result instanceof Error) throw result;
       return result;
     },
-    findUserBySparkPubkey: async (...args) => {
+    findUserBySparkPubkey: async (...args: [string]) => {
       calls.push({ method: "findUserBySparkPubkey", args });
       return state.byKey ? state.byKey(args[0]) : null;
     },
-    findUserByUsername: async (...args) => {
+    findUserByUsername: async (...args: [string]) => {
       calls.push({ method: "findUserByUsername", args });
       return state.byName ? state.byName(args[0]) : null;
     },
-    findActiveBindingIntent: async (...args) => {
+    findActiveBindingIntent: async (...args: [string, Date]) => {
       calls.push({ method: "findActiveBindingIntent", args });
       return state.intent ? state.intent(args[0]) : null;
     },
+    isReservedUsername: async (name: string, pubkey: string) => {
+      calls.push({ method: "isReservedUsername", args: [name, pubkey] });
+      return state.reserved ? state.reserved(name, pubkey) : false;
+    },
   };
-  return { repo, calls };
+  return { repo: repo as LnurlpayRepository, calls };
 }
 
 const observed: number[] = [];
@@ -600,6 +605,37 @@ Deno.test("recover returns the full body for a bound key and 404 for unbound or 
   const unbound = build({ state: { byKey: () => null } });
   const missing = await send(unbound, fixture("recover"));
   expect({ status: missing.res.status, json: missing.json }).toEqual({ status: 404, json: "user not found" });
+});
+
+Deno.test("available asks the repository once and is false when that name is reserved", async () => {
+  const seen: Array<{ name: string; pubkey: string }> = [];
+  const built = build({
+    state: {
+      reserved: (name, pubkey) => {
+        seen.push({ name, pubkey });
+        return name === "hel.lo" || name === "hello";
+      },
+    },
+  });
+  const blocked = await send(built, fixture("available", { username: "hel.lo" }));
+  expect({ status: blocked.res.status, json: blocked.json }).toEqual({
+    status: 200,
+    json: { available: false },
+  });
+  const open = await send(built, fixture("available", { username: "carol" }));
+  expect(open.json).toEqual({ available: true });
+  expect(seen).toEqual([
+    { name: "hel.lo", pubkey: PUBKEY },
+    { name: "carol", pubkey: PUBKEY },
+  ]);
+});
+
+Deno.test("available is false for a key-like name and does not ask the repository", async () => {
+  const built = build();
+  const username = "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+  const { res, json } = await send(built, fixture("available", { username }));
+  expect({ status: res.status, json }).toEqual({ status: 200, json: { available: false } });
+  expect(built.calls).toEqual([]);
 });
 
 Deno.test("available follows the name-and-intent matrix", async () => {
