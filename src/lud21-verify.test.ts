@@ -421,11 +421,21 @@ Deno.test("a wallet answer that contradicts itself is pending, never expired", a
   expect(await statusOf(Promise.resolve(body))).toEqual("pending");
 });
 
-Deno.test("an invoice nobody can look up is expired once its expiry passes", async () => {
-  // An NWC invoice whose owner moved to Spark: the wallet secret is gone, so there is nothing to ask.
+Deno.test("an NWC invoice whose owner moved to Spark is pending, never expired, even past the expiry", async () => {
+  // The old wallet secret is gone, so Lite cannot know whether the payer paid it: it must not claim expiry.
   const noLookup = { ownerDestination: "spark", lookupInvoice: () => Promise.reject(new Error("never asked")) };
-  expect(await statusOf(verifyOk(EXPIRY_SECS - 1, noLookup))).toEqual("pending");
-  expect(await statusOf(verifyOk(EXPIRY_SECS, noLookup))).toEqual("expired");
+  for (const seconds of [0, EXPIRY_SECS - 1, EXPIRY_SECS, 10_000]) {
+    expect({ seconds, body: await verifyOk(seconds, noLookup) }).toEqual({
+      seconds,
+      body: {
+        status: "OK",
+        settled: false,
+        preimage: null,
+        pr: liveInvoice.paymentRequest,
+        payment_status: "pending",
+      },
+    });
+  }
 });
 
 Deno.test("a stored payment request that cannot be decoded is pending whatever the time", async () => {
