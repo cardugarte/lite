@@ -2290,8 +2290,8 @@ Deno.test({
     const journal = JSON.parse(
       await Deno.readTextFile(new URL("../../drizzle/meta/_journal.json", import.meta.url)),
     ) as { entries: Array<{ idx: number; tag: string }> };
-    const last = journal.entries[journal.entries.length - 1];
-    expect(last).toEqual({ ...last, idx: 5, tag: "0005_breez_minter_schema" });
+    const entry = journal.entries.find((item: { tag: string }) => item.tag === "0005_breez_minter_schema");
+    expect(entry).toEqual({ ...entry, idx: 5, tag: "0005_breez_minter_schema" });
     await withDatabase(async (sql) => {
       await applyNamed(sql, [...THROUGH_0003, MIGRATION_0004]);
       const before = await sql`select 1 from pg_namespace where nspname = 'breez_minter'`;

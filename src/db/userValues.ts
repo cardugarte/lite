@@ -23,8 +23,9 @@ export const USERNAME_PATTERN =
 export const normalizeUsername = (raw: string): string => raw.trim().toLowerCase();
 
 /** Why a normalized username is unusable, or null when it is valid. Length is checked before the pattern. */
-export function usernameProblem(normalized: string): "too_long" | "invalid" | null {
+export function usernameProblem(normalized: string): "too_long" | "too_short" | "invalid" | null {
   if (normalized.length > USERNAME_MAX_LENGTH) return "too_long";
+  if (normalized.length < 3) return "too_short";
   if (!USERNAME_PATTERN.test(normalized)) return "invalid";
   return null;
 }

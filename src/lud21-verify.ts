@@ -174,7 +174,10 @@ export async function verifyInvoiceSettlement(input: {
     if (outcome?.kind !== "unpaid") input.onMissingSettlement?.(invoice);
     return outcome?.kind === "unknown" ? unpaid("pending") : byExpiry();
   }
-  if (invoice.mintedBy !== "nwc" || input.ownerDestination !== "nwc") return byExpiry();
+  if (invoice.mintedBy !== "nwc") return byExpiry();
+  // The owner switched away from NWC: the wallet secret is gone, so Lite cannot ask whether the payer paid it.
+  // Never claim expiry for a payment it cannot rule out.
+  if (input.ownerDestination !== "nwc") return unpaid("pending");
 
   let lookup: NwcLookupResult | null;
   try {
