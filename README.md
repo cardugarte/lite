@@ -163,11 +163,11 @@ Names only; set secrets in the environment, never in the repository. Copy
 | `BASE_URL` | yes | Payer-facing origin. Its host (lowercase, default port dropped) is the **LNURL domain** that is signed and published. Dev: `https://lite-dev.travelsats.ar`. Prod: `https://travelsats.ar`. |
 | `DATABASE_URL` | yes | Postgres connection string. Migrations run at startup. |
 | `ENCRYPTION_KEY` | yes | Key that encrypts NWC connection secrets in the database (`deno task db:generate:key`). |
-| `TRAVELSATS_REGISTRATION_SECRET` | yes | Authorizes `/users` writes. Same value as the app's. Unset or blank answers `503`. Generate with `openssl rand -hex 32`. |
+| `TRAVELSATS_REGISTRATION_SECRET` | yes | Authorizes `/users` writes. Same value as the app's. Unset or blank answers `503`. Also derives the key that signs [settlement notices](#settlement-notice-to-the-app). Generate with `openssl rand -hex 32`. |
 | `LITE_ADMIN_TOKEN` | admin | Authorizes `/admin/reserved-usernames`. Compared in constant time to `Authorization: Bearer`. Unset or blank answers `401`. Any assignable name can be assigned to any 64-hex pubkey. |
 | `USERNAME_AVAILABILITY_RATE_LIMIT` | no | Max `GET /usernames/:username/availability` requests per IP. Default 50, the PWA `user_profile` tier. |
 | `USERNAME_AVAILABILITY_RATE_WINDOW_SECONDS` | no | Sliding window for that limit. Default 60. |
-| `APP_ORIGINS` | dev only | Comma-separated browser origins allowed on `/lnurlpay/*`. Dev: `https://dev.travelsats.ar`. Unset (prod): the `BASE_URL` origin. |
+| `APP_ORIGINS` | dev only | Comma-separated browser origins allowed on `/lnurlpay/*`; the first one is also where [settlement notices](#settlement-notice-to-the-app) go. Dev: `https://dev.travelsats.ar`. Unset (prod): the `BASE_URL` origin. |
 | `SPARK_WEBHOOK_URL` | prod | Absolute URL registered with the minter webhook. Default `${BASE_URL}/spark/webhook`. Set it explicitly in prod, where `BASE_URL` is the app and not Lite's own origin (Fly origin plus `/spark/webhook`). Compared as an exact string. |
 | `SPARK_WEBHOOK_SECRET` | with minter | HMAC secret registered with the minter webhook. |
 | `SPARK_MINTER_MNEMONIC` | with minter | Seed of the **minter** wallet only. Distinct per environment. Not a user seed. Its identity also signs the authentication that lets Lite read the minter's receive requests from the SSP. |
@@ -257,6 +257,44 @@ observed on mainnet on 2026-10-04; [ADR 0014](https://github.com/cardugarte/trav
 (minting through the Spark SDK and querying the request by id), and the halt
 condition if the list stops serving this.
 
+### Settlement notice to the app
+
+The first time Lite records an invoice as settled, it tells the Travelsats app
+with one signed `POST`, so a payment is noticed with the app closed. The notice
+is only a cue: the app re-verifies through `GET /lnurlp/:username/verify/:payment_hash`,
+so it carries no authority and the app answers the same for a hash it does not
+know.
+
+- **Where it fires.** From the conditional settlement write in `src/db/db.ts`
+  (`markInvoiceSettled` for NWC, `settleSparkInvoice` for Spark), which every
+  path ends in: the NWC `payment_received` notification, the NWC lookup done by
+  verify, the Spark webhook and the Spark reconcile. Only the write that
+  actually records the settlement notifies; a repeat write does not.
+- **Which invoices.** Only invoices the app minted for a booking. Lite's
+  `minted_by` column holds the wallet kind (`nwc` or `spark`), not the caller,
+  and the app mints through the public LNURL-pay callback, so Lite recognizes a
+  booking invoice by the description the app sends as the callback `comment`
+  (it ends with ` | travelsats.ar`; stored as the description and
+  `metadata.comment`). A zap (a stored zap request) is never reported, and a tip
+  carries no such description. A payer who types the same suffix only causes a
+  harmless extra re-verify.
+- **Request.** `POST <origin>/api/lightning/settlement-notice` with the body
+  `{"payment_hash":"<64 lowercase hex>"}` and nothing else, plus
+  `X-Travelsats-Timestamp` (unix seconds) and `X-Travelsats-Signature`
+  (lowercase hex). The key is `HMAC-SHA256(TRAVELSATS_REGISTRATION_SECRET,
+  "settlement-notice-v1")` and the signature is
+  `HMAC-SHA256(key, "<timestamp>.<raw body>")`; the raw secret never signs.
+- **Target and configuration.** No new variable. The origin is the first
+  `APP_ORIGINS` entry that is an http(s) origin (unset, `APP_ORIGINS` is the
+  `BASE_URL` origin, which is the app in production). With no such origin, or
+  with `TRAVELSATS_REGISTRATION_SECRET` unset, nothing is sent.
+- **Delivery.** After the write, never awaited, never failing the settlement.
+  Each request has a 2 second deadline. A network error, timeout or `5xx` is
+  retried in place, 3 attempts in all with 250 ms and 500 ms of backoff (under
+  7 seconds in the worst case); a `4xx` is final. Then it gives up with one
+  `settlement_notice_failed` line. There is no queue and no stored retry state;
+  a lost notice is recovered by the app's own read-time reconcile.
+
 ### Log events
 
 Webhook failures and settlements Lite could not confirm show up as structured
@@ -273,6 +311,8 @@ log events (the `event` field):
 | `spark_reconcile_failed` | warn | The SSP lookup could not finish (`errorName`, plus `kind` and `http_status` for an SSP error). At most one a minute; `suppressed` counts those held back. |
 | `spark_reconcile_hash_mismatch` | warn | The SSP record carried a preimage that hashes to another invoice. Nothing was settled. |
 | `spark_settlement_missing` | warn | Verify saw a Spark invoice unsettled more than 5 minutes after creation, and Lite could not ask the SSP or the SSP could not answer. Once per payment hash per process, at most 1,000 hashes tracked. |
+| `settlement_notice_sent` | info | The app accepted a settlement notice (`attempts` says how many tries it took). |
+| `settlement_notice_failed` | warn | A settlement notice was given up on after its bounded retries, or on a `4xx`. Carries the payment hash and `attempts`, never the secret or the signature. |
 | `nwc_preimage_mismatch` | warn | An NWC lookup that reported the invoice settled, or a notification, carried a preimage that does not hash to the payment hash. |
 
 The webhook rows above also appear with `source: "ssp_list"` when the SSP list,

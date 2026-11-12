@@ -105,15 +105,51 @@ export async function runMigration() {
   });
 }
 
+/** What a settlement hook is told about the invoice whose first settlement write just happened. */
+export type SettledInvoice = {
+  paymentHash: string;
+  description: string | null;
+  metadata: unknown;
+};
+
+export type DBOptions = {
+  /**
+   * Called after the write that FIRST records an invoice as settled, never for a repeat write.
+   * Every settling path (NWC notification, NWC lookup by verify, Spark webhook, Spark reconcile)
+   * ends in `markInvoiceSettled` or `settleSparkInvoice`, so this is the one place all of them meet.
+   * It is not awaited: a hook that throws or rejects never fails or changes the settlement.
+   */
+  onFirstSettlement?: (invoice: SettledInvoice) => unknown;
+};
+
+const settledColumns = {
+  paymentHash: invoices.paymentHash,
+  description: invoices.description,
+  metadata: invoices.metadata,
+};
+
 export class DB {
   private _db: Database;
   private readonly _client: ReturnType<typeof postgres>;
+  private readonly _onFirstSettlement?: DBOptions["onFirstSettlement"];
 
-  constructor(databaseUrl: string = DATABASE_URL) {
+  constructor(databaseUrl: string = DATABASE_URL, options: DBOptions = {}) {
     this._client = postgres(databaseUrl);
     this._db = drizzle(this._client, {
       schema,
     });
+    this._onFirstSettlement = options.onFirstSettlement;
+  }
+
+  /** Fires the settlement hook without awaiting it and without letting it fail the write. */
+  private notifyFirstSettlement(invoice: SettledInvoice): void {
+    if (!this._onFirstSettlement) return;
+    try {
+      const pending = this._onFirstSettlement(invoice);
+      if (pending instanceof Promise) pending.catch(() => {});
+    } catch {
+      // A hook failure never reaches the settlement path.
+    }
   }
 
   async close(): Promise<void> {
@@ -602,11 +638,12 @@ export class DB {
     return result;
   }
 
+  /** Write-once settlement of an NWC-minted invoice. True only when THIS call wrote it. */
   async markInvoiceSettled(
     userId: number,
     transaction: nwc.Nip47Transaction
-  ): Promise<void> {
-    await this._db
+  ): Promise<boolean> {
+    const updated = await this._db
       .update(invoices)
       .set({
         preimage: transaction.preimage,
@@ -620,8 +657,9 @@ export class DB {
           isNull(invoices.preimage),
         )
       )
+      .returning(settledColumns);
 
-    return;
+    return this.reportFirstSettlement(updated);
   }
 
   /** The invoice for a payment hash, or null. Unlike `findInvoice` it never hides a database error. */
@@ -656,8 +694,20 @@ export class DB {
           isNull(invoices.preimage),
         )
       )
-      .returning({ id: invoices.id });
-    return updated.length > 0 ? "settled" : "already_settled";
+      .returning(settledColumns);
+    return this.reportFirstSettlement(updated) ? "settled" : "already_settled";
+  }
+
+  /** True when the conditional UPDATE wrote a row; fires the settlement hook for that first write. */
+  private reportFirstSettlement(updated: SettledInvoice[]): boolean {
+    const [first] = updated;
+    if (!first) return false;
+    this.notifyFirstSettlement({
+      paymentHash: first.paymentHash,
+      description: first.description,
+      metadata: first.metadata,
+    });
+    return true;
   }
 
 }
