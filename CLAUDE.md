@@ -76,8 +76,12 @@ Uses Drizzle ORM with PostgreSQL:
    `onFirstSettlement`, wired in `main.ts` to `src/settlement-notice.ts`. It
    sends one HMAC-signed `POST /api/lightning/settlement-notice` with only the
    payment hash to the first `APP_ORIGINS` origin; the app re-verifies through
-   verify, so the notice is a cue and carries no authority. No new variable: the
-   key derives from `TRAVELSATS_REGISTRATION_SECRET` (unset: nothing is sent).
+   verify, so the notice is a cue and carries no authority. The key
+   derives from `TRAVELSATS_REGISTRATION_SECRET` (unset: nothing is sent). Dev
+   only, optional `VERCEL_PROTECTION_BYPASS` adds the
+   `x-vercel-protection-bypass` header so the notice passes Vercel Deployment
+   Protection (secret from the project's Protection Bypass for Automation;
+   never logged). Redirects are not followed: a 3xx counts as a failed attempt.
    Booking invoices are recognized by the app's callback comment (suffix
    ` | travelsats.ar`), since `minted_by` only records nwc or spark; zaps never
    notify. Fire-and-forget, 3 attempts with short backoff, no queue, no stored

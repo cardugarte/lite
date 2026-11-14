@@ -15,6 +15,8 @@ const SECRET = "registration-secret-for-vector";
 const HASH = "ab".repeat(32);
 const BOOKING_DESCRIPTION = "Rafting in Mendoza - 3 people | travelsats.ar";
 const ORIGIN = "https://travelsats.ar";
+const BYPASS = "vercel-bypass-secret-for-tests";
+const BYPASS_HEADER = "x-vercel-protection-bypass";
 
 // Computed with `openssl dgst`, not with the code under test:
 //   key       = HMAC-SHA256(SECRET, "settlement-notice-v1")  (hex 40332a71...d28e)
@@ -36,6 +38,7 @@ function harness(options: {
   origins?: readonly string[];
   answers?: Array<number | Error>;
   requestTimeoutMs?: number;
+  bypass?: string | null | undefined;
 } = {}) {
   const calls: Call[] = [];
   const sleeps: number[] = [];
@@ -55,6 +58,7 @@ function harness(options: {
     },
     now: () => new Date(1_700_000_000_000),
     requestTimeoutMs: options.requestTimeoutMs,
+    ...("bypass" in options ? { protectionBypass: () => options.bypass } : {}),
   });
   return { notifier, calls, sleeps };
 }
@@ -233,4 +237,99 @@ Deno.test("notify never throws, whatever the transport or the sleeper does", asy
     fetch: (() => Promise.resolve(new Response("{}"))) as typeof fetch,
   });
   expect(await badSecret.notify(bookingInvoice())).toEqual("skipped");
+});
+
+// ---- Vercel protection bypass (dev only) ----
+
+Deno.test("a configured bypass secret is sent as x-vercel-protection-bypass on every attempt", async () => {
+  const h = harness({ bypass: BYPASS, answers: [500, 200] });
+  expect(await h.notifier.notify(bookingInvoice())).toEqual("sent");
+  expect(h.calls.length).toBe(2);
+  for (const { init } of h.calls) {
+    expect(new Headers(init.headers).get(BYPASS_HEADER)).toEqual(BYPASS);
+  }
+});
+
+Deno.test("an unset or blank bypass secret adds no header and leaves the request as before", async () => {
+  for (const bypass of [undefined, null, "", "   "]) {
+    const h = harness({ bypass });
+    expect(await h.notifier.notify(bookingInvoice())).toEqual("sent");
+    const headers = new Headers(h.calls[0].init.headers);
+    expect(headers.has(BYPASS_HEADER)).toBe(false);
+    expect(headers.get("X-Travelsats-Signature")).toEqual(VECTOR_SIGNATURE);
+  }
+});
+
+Deno.test("the bypass secret is read from VERCEL_PROTECTION_BYPASS when no override is injected", async () => {
+  const calls: Call[] = [];
+  const notifier = createSettlementNotifier({
+    secret: () => SECRET,
+    origins: [ORIGIN],
+    fetch: ((input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init: init ?? {} });
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }) as typeof fetch,
+    sleep: async () => {},
+  });
+  const previous = Deno.env.get("VERCEL_PROTECTION_BYPASS");
+  try {
+    Deno.env.set("VERCEL_PROTECTION_BYPASS", BYPASS);
+    await notifier.notify(bookingInvoice());
+    Deno.env.delete("VERCEL_PROTECTION_BYPASS");
+    await notifier.notify(bookingInvoice());
+  } finally {
+    if (previous === undefined) Deno.env.delete("VERCEL_PROTECTION_BYPASS");
+    else Deno.env.set("VERCEL_PROTECTION_BYPASS", previous);
+  }
+  expect(new Headers(calls[0].init.headers).get(BYPASS_HEADER)).toEqual(BYPASS);
+  expect(new Headers(calls[1].init.headers).has(BYPASS_HEADER)).toBe(false);
+});
+
+Deno.test("the bypass secret never appears in logs, on success or failure", async () => {
+  const failing = harness({ bypass: BYPASS, answers: [503, new TypeError(`refused ${BYPASS}`), 502] });
+  const failed = await captureLogs(() => failing.notifier.notify(bookingInvoice()));
+  expect(failed.result).toEqual("failed");
+  expect(failed.raw).not.toContain(BYPASS);
+  expect(failed.raw).not.toContain(SECRET);
+
+  const ok = harness({ bypass: BYPASS });
+  const sent = await captureLogs(() => ok.notifier.notify(bookingInvoice()));
+  expect(sent.result).toEqual("sent");
+  expect(sent.raw).not.toContain(BYPASS);
+
+  const throwing = createSettlementNotifier({
+    secret: () => SECRET,
+    protectionBypass: () => {
+      throw new Error(`env unavailable ${BYPASS}`);
+    },
+    origins: [ORIGIN],
+    fetch: (() => Promise.resolve(new Response("{}"))) as typeof fetch,
+    sleep: async () => {},
+  });
+  const broken = await captureLogs(() => throwing.notify(bookingInvoice()));
+  expect(broken.raw).not.toContain(BYPASS);
+});
+
+Deno.test("a redirect to a login page is a failed attempt, never delivered, and is retried within the bound", async () => {
+  const calls: Call[] = [];
+  const sleeps: number[] = [];
+  const notifier = createSettlementNotifier({
+    secret: () => SECRET,
+    protectionBypass: () => null,
+    origins: [ORIGIN],
+    fetch: ((input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init: init ?? {} });
+      return Promise.resolve(new Response(null, { status: 302, headers: { location: "https://vercel.com/sso-api?url=x" } }));
+    }) as typeof fetch,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+  const { result, entries } = await captureLogs(() => notifier.notify(bookingInvoice()));
+  expect(result).toEqual("failed");
+  expect(calls.length).toBe(NOTICE_MAX_ATTEMPTS);
+  expect(sleeps).toEqual(NOTICE_BACKOFF_MS);
+  expect(calls.every(({ init }) => init.redirect === "manual")).toBe(true);
+  expect(entriesFor(entries, "settlement_notice_sent").length).toBe(0);
+  expect(entriesFor(entries, "settlement_notice_failed").length).toBe(1);
 });

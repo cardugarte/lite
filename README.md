@@ -168,6 +168,7 @@ Names only; set secrets in the environment, never in the repository. Copy
 | `USERNAME_AVAILABILITY_RATE_LIMIT` | no | Max `GET /usernames/:username/availability` requests per IP. Default 50, the PWA `user_profile` tier. |
 | `USERNAME_AVAILABILITY_RATE_WINDOW_SECONDS` | no | Sliding window for that limit. Default 60. |
 | `APP_ORIGINS` | dev only | Comma-separated browser origins allowed on `/lnurlpay/*`; the first one is also where [settlement notices](#settlement-notice-to-the-app) go. Dev: `https://dev.travelsats.ar`. Unset (prod): the `BASE_URL` origin. |
+| `VERCEL_PROTECTION_BYPASS` | dev only | Lets [settlement notices](#settlement-notice-to-the-app) through Vercel Deployment Protection, which otherwise answers every unauthenticated request to the dev app with a `302` to a Vercel login page. When set and not blank, each notice carries `x-vercel-protection-bypass: <value>`. The value is the Vercel project's "Protection Bypass for Automation" secret. Leave it unset in production: no header is sent. Never logged. |
 | `SPARK_WEBHOOK_URL` | prod | Absolute URL registered with the minter webhook. Default `${BASE_URL}/spark/webhook`. Set it explicitly in prod, where `BASE_URL` is the app and not Lite's own origin (Fly origin plus `/spark/webhook`). Compared as an exact string. |
 | `SPARK_WEBHOOK_SECRET` | with minter | HMAC secret registered with the minter webhook. |
 | `SPARK_MINTER_MNEMONIC` | with minter | Seed of the **minter** wallet only. Distinct per environment. Not a user seed. Its identity also signs the authentication that lets Lite read the minter's receive requests from the SSP. |
@@ -284,14 +285,19 @@ know.
   (lowercase hex). The key is `HMAC-SHA256(TRAVELSATS_REGISTRATION_SECRET,
   "settlement-notice-v1")` and the signature is
   `HMAC-SHA256(key, "<timestamp>.<raw body>")`; the raw secret never signs.
-- **Target and configuration.** No new variable. The origin is the first
+- **Target and configuration.** The origin is the first
   `APP_ORIGINS` entry that is an http(s) origin (unset, `APP_ORIGINS` is the
   `BASE_URL` origin, which is the app in production). With no such origin, or
-  with `TRAVELSATS_REGISTRATION_SECRET` unset, nothing is sent.
+  with `TRAVELSATS_REGISTRATION_SECRET` unset, nothing is sent. Dev only, the
+  optional `VERCEL_PROTECTION_BYPASS` adds the `x-vercel-protection-bypass`
+  header so the notice passes Vercel Deployment Protection on the dev app (the
+  secret comes from the Vercel project's Protection Bypass for Automation).
+  Unset or blank, no header is sent; the value is never logged.
 - **Delivery.** After the write, never awaited, never failing the settlement.
-  Each request has a 2 second deadline. A network error, timeout or `5xx` is
-  retried in place, 3 attempts in all with 250 ms and 500 ms of backoff (under
-  7 seconds in the worst case); a `4xx` is final. Then it gives up with one
+  Each request has a 2 second deadline. A network error, timeout, redirect or
+  `5xx` is retried in place, 3 attempts in all with 250 ms and 500 ms of backoff
+  (under 7 seconds in the worst case); a `4xx` is final. Redirects are never
+  followed: a `302` to a login page is a failed attempt, never a delivery. Then it gives up with one
   `settlement_notice_failed` line. There is no queue and no stored retry state;
   a lost notice is recovered by the app's own read-time reconcile.
 

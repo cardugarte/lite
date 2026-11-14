@@ -18,6 +18,10 @@ import { logger } from "./logger.ts";
  * The raw secret never signs:
  *   key       = HMAC-SHA256(secret, "settlement-notice-v1")
  *   signature = hex(HMAC-SHA256(key, "<timestamp>.<raw body>"))
+ *
+ * Optional, dev only: when `VERCEL_PROTECTION_BYPASS` is set, every request also carries
+ * `x-vercel-protection-bypass: <value>` so it passes Vercel Deployment Protection. Unset or blank
+ * (production), no such header is sent. The value is never logged.
  */
 
 /** The derivation label of the signing key. The app mirrors it byte for byte. */
@@ -25,6 +29,8 @@ export const NOTICE_KEY_LABEL = "settlement-notice-v1";
 export const NOTICE_PATH = "/api/lightning/settlement-notice";
 const TIMESTAMP_HEADER = "X-Travelsats-Timestamp";
 const SIGNATURE_HEADER = "X-Travelsats-Signature";
+/** Vercel's "Protection Bypass for Automation" header. Dev only: the dev app sits behind Deployment Protection. */
+const BYPASS_HEADER = "x-vercel-protection-bypass";
 
 /** Attempts per notice: the first send plus two retries. */
 export const NOTICE_MAX_ATTEMPTS = 3;
@@ -101,11 +107,18 @@ function readRegistrationSecret(): string | undefined {
   return Deno.env.get("TRAVELSATS_REGISTRATION_SECRET");
 }
 
+/** The Vercel protection bypass secret, or undefined when unset. Read at call time. */
+function readProtectionBypass(): string | undefined {
+  return Deno.env.get("VERCEL_PROTECTION_BYPASS");
+}
+
 export interface SettlementNotifierDeps {
   /** App origins, in order (`APP_ORIGINS`). */
   origins: readonly string[];
   /** The shared secret. Defaults to `TRAVELSATS_REGISTRATION_SECRET`, read per notice. */
   secret?: () => string | null | undefined;
+  /** Vercel Protection Bypass for Automation secret. Defaults to `VERCEL_PROTECTION_BYPASS`, read per notice. */
+  protectionBypass?: () => string | null | undefined;
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
@@ -116,7 +129,7 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
 
 /**
  * `notify` delivers one notice and never throws or rejects. The caller does not await it: it runs
- * after the settlement write, with a few in-place retries on a network error, a timeout or a 5xx,
+ * after the settlement write, with a few in-place retries on a network error, a timeout, a redirect or a 5xx,
  * then gives up with one log line. No queue and no persisted retry state: a notice that is lost is
  * recovered by the app's own read-time reconcile.
  */
@@ -126,9 +139,19 @@ export function createSettlementNotifier(deps: SettlementNotifierDeps) {
   const now = deps.now ?? (() => new Date());
   const timeoutMs = deps.requestTimeoutMs ?? NOTICE_REQUEST_TIMEOUT_MS;
   const readSecret = deps.secret ?? readRegistrationSecret;
+  const readBypass = deps.protectionBypass ?? readProtectionBypass;
 
-  /** One request. "retry" for a network error, a timeout or a 5xx; "final" for any other non-2xx answer. */
-  async function attempt(url: string, secret: string, rawBody: string): Promise<"ok" | "retry" | "final"> {
+  /**
+   * One request. "retry" for a network error, a timeout, a redirect or a 5xx; "final" for a 4xx.
+   * Redirects are never followed (`redirect: "manual"`): a 3xx is the app's login or protection wall,
+   * so it is a failed attempt, never a delivery.
+   */
+  async function attempt(
+    url: string,
+    secret: string,
+    bypass: string | undefined,
+    rawBody: string,
+  ): Promise<"ok" | "retry" | "final"> {
     const timestamp = String(Math.floor(now().getTime() / 1000));
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -139,6 +162,7 @@ export function createSettlementNotifier(deps: SettlementNotifierDeps) {
           "Content-Type": "application/json",
           [TIMESTAMP_HEADER]: timestamp,
           [SIGNATURE_HEADER]: signSettlementNotice(secret, timestamp, rawBody),
+          ...(bypass ? { [BYPASS_HEADER]: bypass } : {}),
         },
         body: rawBody,
         redirect: "manual",
@@ -146,7 +170,7 @@ export function createSettlementNotifier(deps: SettlementNotifierDeps) {
       });
       await response.body?.cancel().catch(() => {});
       if (response.status >= 200 && response.status < 300) return "ok";
-      return response.status >= 500 ? "retry" : "final";
+      return response.status >= 500 || (response.status >= 300 && response.status < 400) ? "retry" : "final";
     } catch {
       return "retry";
     } finally {
@@ -170,13 +194,20 @@ export function createSettlementNotifier(deps: SettlementNotifierDeps) {
     const paymentHash = invoice.paymentHash.toLowerCase();
     const rawBody = JSON.stringify({ payment_hash: paymentHash });
     const url = `${target}${NOTICE_PATH}`;
+    let bypass: string | undefined;
+    try {
+      const value = readBypass();
+      bypass = value && value.trim() !== "" ? value.trim() : undefined;
+    } catch {
+      bypass = undefined;
+    }
 
     let attempts = 0;
     let verdict: "ok" | "retry" | "final" = "retry";
     while (attempts < NOTICE_MAX_ATTEMPTS && verdict === "retry") {
       if (attempts > 0) await sleep(NOTICE_BACKOFF_MS[attempts - 1] ?? 0);
       attempts += 1;
-      verdict = await attempt(url, secret, rawBody);
+      verdict = await attempt(url, secret, bypass, rawBody);
     }
 
     if (verdict === "ok") {
