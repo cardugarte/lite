@@ -70,6 +70,24 @@ Uses Drizzle ORM with PostgreSQL:
    settled by its webhook; when that has not happened, verify asks the SSP list
    through `spark/reconcile.ts` (never the NWC wallet, never the SDK).
 
+6. **Settlement notice** — the first write that records an app-minted booking
+   invoice as settled (`markInvoiceSettled` / `settleSparkInvoice` in
+   `src/db/db.ts`, which all four settling paths end in) fires
+   `onFirstSettlement`, wired in `main.ts` to `src/settlement-notice.ts`. It
+   sends one HMAC-signed `POST /api/lightning/settlement-notice` with only the
+   payment hash to the first `APP_ORIGINS` origin; the app re-verifies through
+   verify, so the notice is a cue and carries no authority. The key
+   derives from `TRAVELSATS_REGISTRATION_SECRET` (unset: nothing is sent). Dev
+   only, optional `VERCEL_PROTECTION_BYPASS` adds the
+   `x-vercel-protection-bypass` header so the notice passes Vercel Deployment
+   Protection (secret from the project's Protection Bypass for Automation;
+   never logged). Redirects are not followed: a 3xx counts as a failed attempt.
+   Booking invoices are recognized by the app's callback comment (suffix
+   ` | travelsats.ar`), since `minted_by` only records nwc or spark; zaps never
+   notify. Fire-and-forget, 3 attempts with short backoff, no queue, no stored
+   retry state. Details: README "Settlement notice to the app".
+   Tests: `src/settlement-notice.test.ts`, `src/db/settlementHook.test.ts`.
+
 ## Environment Variables
 
 Required in `.env` (see `.env.example`):
