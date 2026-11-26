@@ -1,5 +1,6 @@
 import { buildApp } from "./app.ts";
 import {
+  APP_ORIGINS,
   BASE_URL,
   BREEZ_API_KEY,
   DATABASE_URL,
@@ -11,6 +12,7 @@ import {
 import { DB, runMigration } from "./db/db.ts";
 import { LOG_LEVEL, logger } from "./logger.ts";
 import { NWCPool } from "./nwc/nwcPool.ts";
+import { createSettlementNotifier } from "./settlement-notice.ts";
 import {
   createBreezIdentitySigner,
   createBreezSparkMinter,
@@ -22,7 +24,10 @@ import { createSspClient } from "./spark/ssp.ts";
 
 await runMigration();
 
-const db = new DB();
+// The first time an app-minted booking invoice is recorded as settled, the app is told so it can
+// re-verify. Fire-and-forget: the notifier never throws and never blocks a settlement.
+const settlementNotifier = createSettlementNotifier({ origins: APP_ORIGINS });
+const db = new DB(DATABASE_URL, { onFirstSettlement: settlementNotifier.notify });
 const nwcPool = new NWCPool(db);
 await nwcPool.init();
 const sparkMinter = BREEZ_API_KEY && SPARK_MINTER_MNEMONIC && SPARK_WEBHOOK_SECRET
